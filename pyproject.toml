@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "riverforecast"
+version = "0.1.0"
+description = "14-day river flow forecasting for USGS sensors in the Mountain West"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [{ name = "River Forecasting Contributors" }]
+dependencies = [
+    "requests>=2.31.0",
+    "numpy>=1.24.0",
+    "pandas>=2.0.0",
+    "scipy>=1.11.0",
+    "click>=8.1.0",
+    "rich>=13.0.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "pytest-cov", "ruff"]
+plot = ["matplotlib>=3.7.0"]
+
+[project.scripts]
+riverforecast = "riverforecast.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["riverforecast*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
