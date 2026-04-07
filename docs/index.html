@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>River Forecast Dashboard — Mountain West</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1><span>&#x1F30A;</span> River Forecast <span>Dashboard</span></h1>
+    <p>14-day streamflow forecasts for USGS sensors across the Mountain West</p>
+    <p style="margin-top:0.3rem;font-size:0.8rem;color:#64748b">Live data from USGS NWIS &bull; NWS Weather API &bull; Degree-day snowmelt &bull; SCS rainfall-runoff</p>
+  </header>
+
+  <div class="container">
+    <!-- Search -->
+    <div class="search-box">
+      <div class="search-row">
+        <div class="field">
+          <label>USGS Site Number</label>
+          <input type="text" id="site-input" placeholder="e.g. 09380000" autocomplete="off">
+        </div>
+        <div class="field">
+          <label>State</label>
+          <select id="state-select">
+            <option value="">All</option>
+            <option value="MT">MT</option>
+            <option value="ID">ID</option>
+            <option value="WY">WY</option>
+            <option value="CO">CO</option>
+            <option value="UT">UT</option>
+            <option value="NV">NV</option>
+            <option value="NM">NM</option>
+            <option value="AZ">AZ</option>
+          </select>
+        </div>
+        <button class="primary" id="go-btn">Generate Forecast</button>
+      </div>
+      <div class="quick-picks">
+        <span>Quick picks:</span>
+        <span class="pick" data-site="09380000">Colorado R. @ Lees Ferry</span>
+        <span class="pick" data-site="09251000">Yampa R. near Maybell</span>
+        <span class="pick" data-site="13011000">Snake R. near Moran</span>
+        <span class="pick" data-site="12340000">Blackfoot R. near Bonner</span>
+        <span class="pick" data-site="10109000">Logan R. above State Dam</span>
+        <span class="pick" data-site="13185000">Boise R. near Twin Springs</span>
+      </div>
+    </div>
+
+    <!-- Status bar -->
+    <div class="status-bar" id="status-bar">
+      <div class="steps" id="steps"></div>
+    </div>
+
+    <!-- Warnings -->
+    <div class="warnings" id="warnings"></div>
+
+    <!-- Results (hidden until forecast runs) -->
+    <div id="results" class="hidden">
+      <!-- Site header -->
+      <div style="margin-bottom:1.2rem">
+        <h2 id="site-name" style="font-size:1.3rem;font-weight:700"></h2>
+        <p id="site-meta" style="color:var(--text-dim);font-size:0.85rem"></p>
+      </div>
+
+      <!-- Summary cards -->
+      <div class="cards">
+        <div class="card" id="card-current"></div>
+        <div class="card" id="card-day7"></div>
+        <div class="card" id="card-day14"></div>
+        <div class="card" id="card-trend"></div>
+      </div>
+
+      <!-- Forecast chart -->
+      <div class="chart-container">
+        <h3>Streamflow Forecast</h3>
+        <canvas id="forecast-chart"></canvas>
+      </div>
+
+      <!-- Components chart -->
+      <div class="chart-container">
+        <h3>Forecast Components</h3>
+        <canvas id="components-chart"></canvas>
+      </div>
+
+      <!-- Data table -->
+      <div class="table-container">
+        <h3>Daily Forecast Detail</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Date</th>
+              <th>Forecast (cfs)</th>
+              <th>Low (cfs)</th>
+              <th>High (cfs)</th>
+              <th>Baseflow</th>
+              <th>Snowmelt</th>
+              <th>Rainfall</th>
+              <th>Hi &deg;F</th>
+              <th>Lo &deg;F</th>
+              <th>Precip</th>
+            </tr>
+          </thead>
+          <tbody id="forecast-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- How it works -->
+    <details style="margin-top:2rem">
+      <summary style="cursor:pointer;color:var(--accent);font-weight:600;font-size:0.95rem">How does this work?</summary>
+      <div style="margin-top:1rem;color:var(--text-dim);font-size:0.9rem;line-height:1.8">
+        <p>This dashboard fetches <strong>live data</strong> directly from federal APIs and runs a simplified hydrological forecast in your browser:</p>
+        <ol style="margin:1rem 0 1rem 1.5rem">
+          <li><strong>Observed streamflow</strong> &mdash; 90 days of daily mean discharge from <a href="https://waterservices.usgs.gov/" style="color:var(--accent)">USGS NWIS</a></li>
+          <li><strong>Weather forecast</strong> &mdash; 7-day gridded temperature &amp; precipitation from the <a href="https://www.weather.gov/documentation/services-web-api" style="color:var(--accent)">NWS API</a></li>
+          <li><strong>Baseflow separation</strong> &mdash; Lyne-Hollick digital filter extracts the slow groundwater component, then projects it forward using fitted exponential recession</li>
+          <li><strong>Snowmelt model</strong> &mdash; Degree-day (temperature-index) method estimates daily melt from forecasted temperatures</li>
+          <li><strong>Rainfall-runoff</strong> &mdash; NRCS/SCS Curve Number method converts forecast precipitation to direct runoff</li>
+          <li><strong>Channel routing</strong> &mdash; Muskingum method attenuates and delays the combined hydrograph</li>
+          <li><strong>Uncertainty</strong> &mdash; Confidence bands widen from &plusmn;15% at day 1 to &plusmn;50% at day 14</li>
+        </ol>
+        <p>The full Python implementation (with SNOTEL snowpack integration, ensemble uncertainty, and more) is available in the <a href="https://github.com/andrewnakas/Riverforecasting" style="color:var(--accent)">GitHub repository</a>.</p>
+      </div>
+    </details>
+  </div>
+
+  <footer>
+    <p>River Forecast Dashboard &bull; Data from USGS &amp; NWS &bull; <a href="https://github.com/andrewnakas/Riverforecasting">GitHub Repository</a></p>
+  </footer>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
