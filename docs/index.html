@@ -6,6 +6,7 @@
   <title>River Forecast Dashboard — Mountain West</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -16,26 +17,35 @@
   </header>
 
   <div class="container">
+    <!-- Map -->
+    <div class="map-container">
+      <div class="map-header">
+        <h3>Mountain West USGS Sensors</h3>
+        <div class="map-controls">
+          <select id="map-state-filter">
+            <option value="">All States</option>
+            <option value="MT">Montana</option>
+            <option value="ID">Idaho</option>
+            <option value="WY">Wyoming</option>
+            <option value="CO" selected>Colorado</option>
+            <option value="UT">Utah</option>
+            <option value="NV">Nevada</option>
+            <option value="NM">New Mexico</option>
+            <option value="AZ">Arizona</option>
+          </select>
+          <button class="secondary" id="load-map-btn">Load Sensors</button>
+          <span class="map-count" id="map-count"></span>
+        </div>
+      </div>
+      <div id="map"></div>
+    </div>
+
     <!-- Search -->
     <div class="search-box">
       <div class="search-row">
         <div class="field">
           <label>USGS Site Number</label>
           <input type="text" id="site-input" placeholder="e.g. 09380000" autocomplete="off">
-        </div>
-        <div class="field">
-          <label>State</label>
-          <select id="state-select">
-            <option value="">All</option>
-            <option value="MT">MT</option>
-            <option value="ID">ID</option>
-            <option value="WY">WY</option>
-            <option value="CO">CO</option>
-            <option value="UT">UT</option>
-            <option value="NV">NV</option>
-            <option value="NM">NM</option>
-            <option value="AZ">AZ</option>
-          </select>
         </div>
         <button class="primary" id="go-btn">Generate Forecast</button>
       </div>
@@ -117,13 +127,13 @@
         <ol style="margin:1rem 0 1rem 1.5rem">
           <li><strong>Observed streamflow</strong> &mdash; 90 days of daily mean discharge from <a href="https://waterservices.usgs.gov/" style="color:var(--accent)">USGS NWIS</a></li>
           <li><strong>Weather forecast</strong> &mdash; 7-day gridded temperature &amp; precipitation from the <a href="https://www.weather.gov/documentation/services-web-api" style="color:var(--accent)">NWS API</a></li>
-          <li><strong>Baseflow separation</strong> &mdash; Lyne-Hollick digital filter extracts the slow groundwater component, then projects it forward using fitted exponential recession</li>
-          <li><strong>Snowmelt model</strong> &mdash; Degree-day (temperature-index) method estimates daily melt from forecasted temperatures</li>
-          <li><strong>Rainfall-runoff</strong> &mdash; NRCS/SCS Curve Number method converts forecast precipitation to direct runoff</li>
-          <li><strong>Channel routing</strong> &mdash; Muskingum method attenuates and delays the combined hydrograph</li>
+          <li><strong>Baseflow separation</strong> &mdash; Lyne-Hollick digital filter with fitted recession constant anchored to current observed flow</li>
+          <li><strong>Snowmelt model</strong> &mdash; Degree-day method scaled by effective snow-contributing area fraction</li>
+          <li><strong>Rainfall-runoff</strong> &mdash; NRCS/SCS Curve Number method with unit hydrograph convolution</li>
+          <li><strong>Channel routing</strong> &mdash; Muskingum method for flood-wave attenuation</li>
           <li><strong>Uncertainty</strong> &mdash; Confidence bands widen from &plusmn;15% at day 1 to &plusmn;50% at day 14</li>
         </ol>
-        <p>The full Python implementation (with SNOTEL snowpack integration, ensemble uncertainty, and more) is available in the <a href="https://github.com/andrewnakas/Riverforecasting" style="color:var(--accent)">GitHub repository</a>.</p>
+        <p>The full Python implementation (with SNOTEL snowpack integration and more) is available in the <a href="https://github.com/andrewnakas/Riverforecasting" style="color:var(--accent)">GitHub repository</a>.</p>
       </div>
     </details>
   </div>
@@ -132,6 +142,7 @@
     <p>River Forecast Dashboard &bull; Data from USGS &amp; NWS &bull; <a href="https://github.com/andrewnakas/Riverforecasting">GitHub Repository</a></p>
   </footer>
 
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
   <script src="app.js"></script>
 </body>
