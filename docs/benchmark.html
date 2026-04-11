@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Forecast Benchmark — River Forecast Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+  <style>
+    .bench-config {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.5rem;
+      margin-bottom: 1.5rem;
+    }
+    .bench-config h3 { font-size: 1rem; font-weight: 600; margin-bottom: 1rem; }
+    .bench-site-list {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+      gap: 0.4rem;
+      margin-bottom: 1rem;
+    }
+    .bench-site-label {
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+      font-size: 0.85rem;
+      color: var(--text);
+      cursor: pointer;
+      padding: 0.3rem 0.5rem;
+      border-radius: 6px;
+      transition: background 0.15s;
+    }
+    .bench-site-label:hover { background: var(--surface2); }
+    .bench-site-label input[type="checkbox"] { accent-color: var(--accent); }
+    .site-id { color: var(--text-dim); font-family: monospace; font-size: 0.8rem; }
+    .bench-controls {
+      display: flex;
+      gap: 0.75rem;
+      align-items: center;
+      flex-wrap: wrap;
+      margin-top: 1rem;
+    }
+    .bench-controls label { font-size: 0.8rem; color: var(--text-dim); }
+    .bench-controls select {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 0.4rem 0.7rem;
+      border-radius: 6px;
+      font-size: 0.85rem;
+    }
+    #bench-progress {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 1rem 1.5rem;
+      margin-bottom: 1.5rem;
+    }
+    .progress-track {
+      background: var(--surface2);
+      border-radius: 6px;
+      height: 8px;
+      overflow: hidden;
+      margin-bottom: 0.5rem;
+    }
+    .progress-fill {
+      background: linear-gradient(90deg, var(--accent), var(--accent2));
+      height: 100%;
+      width: 0%;
+      transition: width 0.3s;
+      border-radius: 6px;
+    }
+    #bench-progress-text { font-size: 0.8rem; color: var(--text-dim); }
+    .bench-charts {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1.5rem;
+      margin-bottom: 1.5rem;
+    }
+    @media (max-width: 800px) {
+      .bench-charts { grid-template-columns: 1fr; }
+      .bench-site-list { grid-template-columns: 1fr; }
+    }
+    .bench-chart-box {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.5rem;
+    }
+    .bench-chart-box canvas { width: 100% !important; height: 280px !important; }
+    #bench-diagnostics {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.5rem;
+      margin-bottom: 1.5rem;
+      font-size: 0.88rem;
+      line-height: 1.9;
+      color: var(--text-dim);
+    }
+    #bench-diagnostics strong { color: var(--text); }
+  </style>
+</head>
+<body>
+  <header>
+    <h1><span>&#x1F4CA;</span> Forecast <span>Benchmark</span></h1>
+    <p>Hindcast evaluation of forecast accuracy across Mountain West USGS sensors</p>
+    <p style="margin-top:0.3rem;font-size:0.8rem;color:#64748b">
+      NSE &bull; RMSE &bull; MAPE &bull; Skill Score vs Climatology &bull; Lead-time Decay Analysis
+    </p>
+  </header>
+
+  <div class="container">
+    <!-- Navigation back to dashboard -->
+    <div style="margin-bottom: 1rem;">
+      <a href="index.html" style="color:var(--accent);text-decoration:none;font-size:0.9rem">&larr; Back to Forecast Dashboard</a>
+    </div>
+
+    <!-- Benchmark Configuration -->
+    <div class="bench-config">
+      <h3>Benchmark Configuration</h3>
+      <p style="font-size:0.85rem;color:var(--text-dim);margin-bottom:1rem">
+        Select sites and time range to evaluate. The benchmark runs hindcasts at past dates and compares forecasts to actual observed flows.
+      </p>
+      <div id="bench-site-list" class="bench-site-list"></div>
+      <div class="bench-controls">
+        <label>Test period:
+          <select id="bench-months">
+            <option value="6">6 months</option>
+            <option value="12" selected>12 months</option>
+            <option value="18">18 months</option>
+            <option value="24">24 months</option>
+          </select>
+        </label>
+        <button class="primary" id="bench-run-btn">Run Benchmark</button>
+        <button class="secondary" id="bench-quick-btn">Quick (3 sites × 6 mo)</button>
+      </div>
+    </div>
+
+    <!-- Progress -->
+    <div id="bench-progress" class="hidden">
+      <div class="progress-track"><div class="progress-fill" id="bench-progress-bar"></div></div>
+      <div id="bench-progress-text">Preparing...</div>
+    </div>
+
+    <!-- Results -->
+    <div id="bench-output" class="hidden">
+      <!-- Summary cards -->
+      <div class="cards">
+        <div class="card" id="bench-card-n"></div>
+        <div class="card" id="bench-card-nse"></div>
+        <div class="card" id="bench-card-mape"></div>
+        <div class="card" id="bench-card-skill"></div>
+      </div>
+
+      <!-- Charts -->
+      <div class="bench-charts">
+        <div class="bench-chart-box">
+          <h3>Method Comparison (NSE)</h3>
+          <canvas id="bench-chart-methods"></canvas>
+        </div>
+        <div class="bench-chart-box">
+          <h3>Skill Decay with Lead Time</h3>
+          <canvas id="bench-chart-leadtime"></canvas>
+        </div>
+      </div>
+
+      <!-- Diagnostics -->
+      <div id="bench-diagnostics"></div>
+
+      <!-- Site table -->
+      <div class="table-container">
+        <h3>Performance by Site</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Site</th>
+              <th>N</th>
+              <th>NSE</th>
+              <th>Log-NSE</th>
+              <th>MAPE</th>
+              <th>% Bias</th>
+              <th>SS vs Clim</th>
+              <th>SS vs Persist</th>
+            </tr>
+          </thead>
+          <tbody id="bench-site-tbody"></tbody>
+        </table>
+      </div>
+
+      <!-- Season table -->
+      <div class="table-container">
+        <h3>Performance by Season</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Season</th>
+              <th>NSE</th>
+              <th>Log-NSE</th>
+              <th>MAPE</th>
+              <th>% Bias</th>
+              <th>SS vs Clim</th>
+            </tr>
+          </thead>
+          <tbody id="bench-season-tbody"></tbody>
+        </table>
+      </div>
+
+      <!-- Detail table -->
+      <div class="table-container">
+        <h3>Individual Hindcast Results</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Site</th>
+              <th>Forecast Date</th>
+              <th>Current Q</th>
+              <th>NSE</th>
+              <th>MAPE</th>
+              <th>% Bias</th>
+              <th>SS vs Clim</th>
+              <th>Phi</th>
+            </tr>
+          </thead>
+          <tbody id="bench-detail-tbody"></tbody>
+        </table>
+      </div>
+
+      <!-- How it works -->
+      <details style="margin-top:1.5rem">
+        <summary style="cursor:pointer;color:var(--accent);font-weight:600;font-size:0.95rem">How does the benchmark work?</summary>
+        <div style="margin-top:1rem;color:var(--text-dim);font-size:0.9rem;line-height:1.8">
+          <p><strong>Hindcasting</strong> is the standard method for evaluating forecast models. For each test date in the past:</p>
+          <ol style="margin:0.5rem 0 1rem 1.5rem">
+            <li>We pretend we're standing on that date, using only data available at the time</li>
+            <li>We generate a 14-day forecast using all three methods (AR(1), KNN, Climatology) plus the blended model</li>
+            <li>We compare the forecast against the <em>actual</em> observed flows that followed</li>
+            <li>We compute standard hydrology metrics (NSE, RMSE, MAE, MAPE, bias, skill scores)</li>
+          </ol>
+          <p style="margin-top:0.5rem"><strong>Metrics explained:</strong></p>
+          <ul style="margin:0.3rem 0 1rem 1.5rem">
+            <li><strong>NSE</strong> (Nash-Sutcliffe Efficiency): 1.0 = perfect, 0.0 = no better than using the mean, &lt;0 = worse than the mean</li>
+            <li><strong>Log-NSE</strong>: NSE in log-space, reduces influence of high flows</li>
+            <li><strong>MAPE</strong>: Mean Absolute Percentage Error — average % deviation</li>
+            <li><strong>% Bias</strong>: Systematic over/under prediction. Positive = over-predicts</li>
+            <li><strong>Skill Score vs Climatology</strong>: &gt;0 means forecast beats the seasonal average</li>
+            <li><strong>Skill Score vs Persistence</strong>: &gt;0 means forecast beats "tomorrow = today"</li>
+          </ul>
+          <p>Results are broken down by site, season, and lead time (day 1-3, 4-7, 8-14) to identify where the model performs best and worst.</p>
+        </div>
+      </details>
+    </div>
+  </div>
+
+  <footer>
+    <p>River Forecast Benchmark &bull; Data from USGS &bull; <a href="index.html">Dashboard</a> &bull; <a href="https://github.com/andrewnakas/Riverforecasting">GitHub</a></p>
+  </footer>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+  <script src="benchmark.js"></script>
+</body>
+</html>
