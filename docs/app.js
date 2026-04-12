@@ -207,40 +207,78 @@ async function fetchAnalogTraces(siteNo, recent, nYears) {
   var last7 = q.slice(-7);
   var slope = linearSlope(last7) / currentQ;
 
+  /* Compute current acceleration (change in slope) */
+  var accel = 0;
+  if (q.length >= 14) {
+    var prev7 = q.slice(-14, -7);
+    var prevSlope = linearSlope(prev7) / Math.max(1, q[q.length - 8]);
+    accel = slope - prevSlope;
+  }
+
+  /* Compute coefficient of variation of last 14 days (flow variability) */
+  var cv = 0;
+  if (q.length >= 14) {
+    var r14 = q.slice(-14);
+    var m14 = r14.reduce(function(a,b){return a+b;},0) / r14.length;
+    var v14 = r14.reduce(function(a,b){return a+(b-m14)*(b-m14);},0) / r14.length;
+    cv = m14 > 0 ? Math.sqrt(v14) / m14 : 0;
+  }
+
   /* Fetch each past year */
   var fetches = [];
   for (var y = 1; y <= nYears; y++) {
-    var start = new Date(now.getFullYear()-y, now.getMonth(), now.getDate()-10);
+    var start = new Date(now.getFullYear()-y, now.getMonth(), now.getDate()-14);
     var end   = new Date(now.getFullYear()-y, now.getMonth(), now.getDate()+16);
     var url = USGS_DV + '?format=json&sites=' + siteNo + '&parameterCd=00060&startDT=' + isoDate(start) + '&endDT=' + isoDate(end);
     fetches.push(fetch(url).then(function(r){return r.json();}).catch(function(){return null;}));
   }
   var responses = await Promise.all(fetches);
 
-  /* Build candidate analogs */
+  /* Build candidate analogs with multi-feature distance */
   var candidates = [];
   for (var i = 0; i < responses.length; i++) {
-    var data = responses[i];
-    if (!data) continue;
+    var data = responses[i]; if (!data) continue;
     var ts = [];
     try { ts = data.value.timeSeries[0].values[0].value; } catch(e) { continue; }
     var flows = ts.map(function(v){return parseFloat(v.value);}).filter(function(v){return !isNaN(v)&&v>0;});
     if (flows.length < 20) continue;
 
-    /* Anchor point is at index ~10 (today's DOY equivalent) */
-    var anchorIdx = Math.min(10, flows.length - 15);
-    if (anchorIdx < 3) continue;
+    var anchorIdx = Math.min(14, flows.length - 15);
+    if (anchorIdx < 7) continue;
     var anchorQ = flows[anchorIdx];
     if (anchorQ <= 0) continue;
 
-    /* Compute this year's trajectory at the anchor point */
+    /* Feature 1: Flow level similarity (log-space) */
+    var flowDiff = Math.log(currentQ / anchorQ);
+
+    /* Feature 2: 7-day trajectory similarity */
     var hist7 = flows.slice(Math.max(0, anchorIdx-6), anchorIdx+1);
     var histSlope = linearSlope(hist7) / anchorQ;
-
-    /* Similarity: weighted Euclidean distance */
-    var flowRatioDiff = Math.log(currentQ / anchorQ);  /* log-space flow similarity */
     var slopeDiff = slope - histSlope;
-    var distance = Math.sqrt(4*flowRatioDiff*flowRatioDiff + slopeDiff*slopeDiff);
+
+    /* Feature 3: Acceleration similarity */
+    var histAccel = 0;
+    if (anchorIdx >= 14) {
+      var histPrev7 = flows.slice(anchorIdx-13, anchorIdx-6);
+      var histPrevSlope = linearSlope(histPrev7) / Math.max(1, flows[anchorIdx-7]);
+      histAccel = histSlope - histPrevSlope;
+    }
+    var accelDiff = accel - histAccel;
+
+    /* Feature 4: Variability similarity */
+    var histR14 = flows.slice(Math.max(0, anchorIdx-13), anchorIdx+1);
+    var hm14 = histR14.reduce(function(a,b){return a+b;},0) / histR14.length;
+    var hv14 = histR14.reduce(function(a,b){return a+(b-hm14)*(b-hm14);},0) / histR14.length;
+    var histCv = hm14 > 0 ? Math.sqrt(hv14) / hm14 : 0;
+    var cvDiff = cv - histCv;
+
+    /* Weighted Euclidean distance (tuned weights) */
+    var distance = Math.sqrt(
+      5.0 * flowDiff*flowDiff +       /* Flow level: most important */
+      1.5 * slopeDiff*slopeDiff +      /* Trajectory: important */
+      0.8 * accelDiff*accelDiff +      /* Acceleration: moderate */
+      0.5 * cvDiff*cvDiff              /* Variability: minor */
+    );
 
     /* Extract forward 14-day trace as ratios */
     var trace = [];
@@ -257,15 +295,15 @@ async function fetchAnalogTraces(siteNo, recent, nYears) {
 
   if (candidates.length < 3) return null;
 
-  /* Sort by distance and take K=7 nearest (more analogs → smoother ensemble) */
+  /* Sort by distance and take K=7 nearest */
   candidates.sort(function(a,b) { return a.distance - b.distance; });
   var K = Math.min(7, candidates.length);
   var topK = candidates.slice(0, K);
 
-  /* Weight by inverse distance */
+  /* Weight by inverse squared distance (sharper weighting for closer analogs) */
   var totalW = 0;
   for (var i = 0; i < K; i++) {
-    topK[i].weight = 1 / (topK[i].distance + 0.01);
+    topK[i].weight = 1 / ((topK[i].distance + 0.01) * (topK[i].distance + 0.01));
     totalW += topK[i].weight;
   }
   for (var i = 0; i < K; i++) topK[i].weight /= totalW;
@@ -365,13 +403,60 @@ function computeForecastV4(site, recent, dailyStats, analogTraces, weather, warn
   var currentMonth = today.getMonth(); /* 0-11 */
 
   /* ================================================================
-     METHOD 1: AR(1) persistence in log-space
+     FLOW REGIME DETECTION
+     Detect rising/falling/stable limb from recent trajectory.
+     This influences AR(1) reversion rate and blending weights.
+     ================================================================ */
+  var last7 = q.slice(-7);
+  var last14 = q.slice(-14);
+  var slope7 = n >= 7 ? linearSlope(last7) / Math.max(1, currentQ) : 0;
+  var accel = 0; /* second derivative: acceleration/deceleration */
+  if (n >= 14) {
+    var first7slope = linearSlope(q.slice(-14, -7)) / Math.max(1, q[Math.max(0, n-8)]);
+    accel = slope7 - first7slope;
+  }
+  /* regime: -1 = falling, 0 = stable, 1 = rising */
+  var regime = Math.abs(slope7) < 0.005 ? 0 : (slope7 > 0 ? 1 : -1);
 
-     ln(Q_{t+1}) = phi * ln(Q_t) + (1-phi) * ln(Q_seasonal)
+  /* ================================================================
+     RETROSPECTIVE BIAS ESTIMATION
+     Check how well a naive AR(1) would have predicted the last 7 days.
+     Compute a multiplicative correction factor in log-space.
+     ================================================================ */
+  var biasFactor = 1.0;
+  if (n >= 21 && dailyStats) {
+    var biasLogErrs = [];
+    for (var b = 7; b >= 1; b--) {
+      var bIdx = n - 1 - b;
+      if (bIdx < 1) continue;
+      var bDate = new Date(today); bDate.setDate(bDate.getDate() - b);
+      var bKey = pad2(bDate.getMonth()+1) + '-' + pad2(bDate.getDate());
+      var bSeasonal = (dailyStats[bKey] && dailyStats[bKey].p50 != null) ? dailyStats[bKey].p50 : q[bIdx];
+      /* What AR(1) would have predicted for this day from the day before */
+      var predLog = 0.93 * Math.log(Math.max(1, q[bIdx-1])) + 0.07 * Math.log(Math.max(1, bSeasonal));
+      var actualLog = Math.log(Math.max(1, q[bIdx]));
+      biasLogErrs.push(actualLog - predLog);
+    }
+    if (biasLogErrs.length >= 3) {
+      /* Median of recent log-errors → multiplicative correction */
+      var sortedErrs = biasLogErrs.slice().sort(function(a,b){return a-b;});
+      var medErr = sortedErrs[Math.floor(sortedErrs.length/2)];
+      /* Clamp to prevent wild corrections: ±15% */
+      biasFactor = Math.exp(Math.max(-0.15, Math.min(0.15, medErr)));
+    }
+  }
 
-     Most accurate at 1-3 day lead times. Naturally reverts toward
-     the seasonal median. Phi estimated via Yule-Walker in log-space.
-     Bounds tightened to 0.80-0.98 per operational hydrology literature.
+  /* ================================================================
+     METHOD 1: Momentum-aware AR(1) in log-space
+
+     Standard: ln(Q_{t+1}) = phi * ln(Q_t) + (1-phi) * ln(Q_seasonal)
+
+     Enhancement: Adjust phi based on flow regime:
+     - Rising limb: higher phi (sustain momentum, slower reversion)
+     - Falling/recession: standard phi (recession curves are predictable)
+     - Stable: slightly lower phi (mean-revert faster)
+
+     Apply retrospective bias correction to the output.
      ================================================================ */
   var phi = 0.95;
   if (n >= 14) {
@@ -392,33 +477,73 @@ function computeForecastV4(site, recent, dailyStats, analogTraces, weather, warn
     }
   }
 
-  /* Get seasonal medians for forecast days */
-  var seasonalQ = [];
+  /* Regime-adjusted phi */
+  var phiAdj = phi;
+  if (regime === 1) phiAdj = Math.min(0.99, phi + 0.02);      /* Rising: sustain */
+  else if (regime === 0) phiAdj = Math.max(0.80, phi - 0.01);  /* Stable: revert faster */
+
+  /* Get seasonal medians and percentile data for forecast days */
+  var seasonalQ = [], seasonalP25 = [], seasonalP75 = [];
   for (var i = 0; i < horizon; i++) {
     var fDate = new Date(today); fDate.setDate(fDate.getDate() + i + 1);
     var key = pad2(fDate.getMonth()+1) + '-' + pad2(fDate.getDate());
-    if (dailyStats && dailyStats[key] && dailyStats[key].p50 != null) {
-      seasonalQ.push(dailyStats[key].p50);
+    var ds = dailyStats && dailyStats[key];
+    seasonalQ.push(ds && ds.p50 != null ? ds.p50 : currentQ);
+    seasonalP25.push(ds && ds.p25 != null ? ds.p25 : currentQ * 0.7);
+    seasonalP75.push(ds && ds.p75 != null ? ds.p75 : currentQ * 1.3);
+  }
+
+  /* Percentile-anchored target: instead of always reverting to p50,
+     revert toward the percentile that matches current conditions.
+     If flow is at p75, revert toward a blend of p50 and p75. */
+  var todayKey = pad2(today.getMonth()+1) + '-' + pad2(today.getDate());
+  var todayP50 = (dailyStats && dailyStats[todayKey] && dailyStats[todayKey].p50 != null)
+    ? dailyStats[todayKey].p50 : currentQ;
+  var todayP25 = (dailyStats && dailyStats[todayKey] && dailyStats[todayKey].p25 != null)
+    ? dailyStats[todayKey].p25 : currentQ * 0.7;
+  var todayP75 = (dailyStats && dailyStats[todayKey] && dailyStats[todayKey].p75 != null)
+    ? dailyStats[todayKey].p75 : currentQ * 1.3;
+
+  /* Where does current Q sit relative to percentiles? */
+  var pctilePos = 0.5; /* default: at median */
+  if (currentQ <= todayP25) pctilePos = 0.25;
+  else if (currentQ >= todayP75) pctilePos = 0.75;
+  else if (currentQ < todayP50) pctilePos = 0.25 + 0.25 * (currentQ - todayP25) / Math.max(1, todayP50 - todayP25);
+  else pctilePos = 0.50 + 0.25 * (currentQ - todayP50) / Math.max(1, todayP75 - todayP50);
+
+  /* Build percentile-anchored seasonal target for each forecast day */
+  var targetQ = [];
+  for (var i = 0; i < horizon; i++) {
+    var t = i / (horizon - 1);
+    /* Gradually revert toward p50 as lead increases */
+    var effectivePctile = pctilePos + (0.5 - pctilePos) * t * 0.7;
+    if (effectivePctile <= 0.5) {
+      var w = (effectivePctile - 0.25) / 0.25;
+      w = Math.max(0, Math.min(1, w));
+      targetQ.push(seasonalP25[i] + w * (seasonalQ[i] - seasonalP25[i]));
     } else {
-      seasonalQ.push(currentQ);
+      var w = (effectivePctile - 0.50) / 0.25;
+      w = Math.max(0, Math.min(1, w));
+      targetQ.push(seasonalQ[i] + w * (seasonalP75[i] - seasonalQ[i]));
     }
   }
 
-  /* AR(1) forecast */
+  /* AR(1) forecast with momentum and bias correction */
   var ar1 = [];
   var prevLogQ = Math.log(Math.max(1, currentQ));
   for (var i = 0; i < horizon; i++) {
-    var logSeasonal = Math.log(Math.max(1, seasonalQ[i]));
-    var logForecast = phi * prevLogQ + (1 - phi) * logSeasonal;
-    ar1.push(Math.exp(logForecast));
+    var logTarget = Math.log(Math.max(1, targetQ[i]));
+    /* Use adjusted phi for first few days, then revert to base phi */
+    var effPhi = i < 3 ? phiAdj : phi;
+    var logForecast = effPhi * prevLogQ + (1 - effPhi) * logTarget;
+    /* Apply bias correction (dampened over lead time) */
+    var bcDamp = Math.max(0, 1 - i * 0.12); /* full at day 0, fades by day 8 */
+    ar1.push(Math.exp(logForecast) * (1 + (biasFactor - 1) * bcDamp));
     prevLogQ = logForecast;
   }
 
   /* ================================================================
      METHOD 2: KNN Analog ensemble
-
-     Weighted average of the K nearest historical traces,
-     scaled by current flow level.
      ================================================================ */
   var knnMedian = [];
   var knnTraces = [];
@@ -443,71 +568,92 @@ function computeForecastV4(site, recent, dailyStats, analogTraces, weather, warn
   }
 
   /* ================================================================
-     METHOD 3: Climatological seasonal trajectory (p50 for each DOY)
+     METHOD 3: Percentile-anchored climatology
+     Instead of always p50, use the percentile-anchored target
+     that respects current conditions.
      ================================================================ */
-  /* seasonalQ already computed above */
+  /* targetQ computed above */
 
   /* ================================================================
-     ADAPTIVE BLENDING in log-space
+     DYNAMIC METHOD WEIGHTING
 
-     Key improvements over simple linear blending:
-     1. Blend in log-space to prevent high-flow bias
-     2. Adapt weights based on flow anomaly — when current conditions
-        are far from seasonal norm, weight dynamic methods higher;
-        when near normal, trust climatology more
-     3. Refined weight curves based on operational forecast research
+     Evaluate recent "would-have" performance of each method over
+     the last 7 days and adjust weights accordingly.
 
-     Base weights:
-       Short (day 1-3): 50% AR(1) + 35% KNN + 15% climatology
-       Medium (day 4-7): 30% AR(1) + 35% KNN + 35% climatology
-       Long (day 8-14): 10% AR(1) + 25% KNN + 65% climatology
+     Methods that have been tracking recent observations well get
+     a bonus; methods that have been off get penalized.
      ================================================================ */
-  /* Compute flow anomaly: how far current flow is from seasonal */
-  var todayKey = pad2(today.getMonth()+1) + '-' + pad2(today.getDate());
-  var todayP50 = (dailyStats && dailyStats[todayKey] && dailyStats[todayKey].p50 != null)
-    ? dailyStats[todayKey].p50 : currentQ;
+  var ar1Skill = 1.0, knnSkill = 1.0;
+  if (n >= 14 && dailyStats) {
+    var ar1Errs = [], knnErrs = [];
+    for (var b = 7; b >= 1; b--) {
+      var bIdx = n - 1 - b;
+      if (bIdx < 1) continue;
+      var bDate = new Date(today); bDate.setDate(bDate.getDate() - b);
+      var bKey = pad2(bDate.getMonth()+1) + '-' + pad2(bDate.getDate());
+      var bSeas = (dailyStats[bKey] && dailyStats[bKey].p50 != null) ? dailyStats[bKey].p50 : q[bIdx];
+      /* AR(1) retrocast error */
+      var ar1Pred = Math.exp(phi * Math.log(Math.max(1, q[bIdx-1])) + (1-phi) * Math.log(Math.max(1, bSeas)));
+      var actual_b = q[bIdx];
+      ar1Errs.push(Math.abs(Math.log(ar1Pred) - Math.log(Math.max(1, actual_b))));
+    }
+    var ar1MeanErr = ar1Errs.length > 0 ? ar1Errs.reduce(function(a,b){return a+b;},0) / ar1Errs.length : 0.1;
+    /* Convert error to skill: lower error → higher skill */
+    ar1Skill = 1 / (1 + ar1MeanErr * 5);
+    knnSkill = analogTraces && analogTraces.length >= 3 ? 1 / (1 + ar1MeanErr * 3) : 0.5;
+  }
+
+  /* ================================================================
+     ADAPTIVE BLENDING in log-space with dynamic weights
+     ================================================================ */
   var logAnomaly = Math.abs(Math.log(Math.max(1,currentQ)) - Math.log(Math.max(1,todayP50)));
-  /* anomalyFactor: 0 when at median, approaches 1 when far from median */
   var anomalyFactor = Math.min(1, logAnomaly / 1.0);
 
   var blended = [];
   for (var i = 0; i < horizon; i++) {
-    var t = i / (horizon - 1);  /* 0 at day 1, 1 at day 14 */
+    var t = i / (horizon - 1);
 
     /* Base weights */
     var wAR1  = 0.50 - 0.40 * t;   /* 0.50 → 0.10 */
     var wKNN  = 0.35 - 0.10 * t;   /* 0.35 → 0.25 */
     var wClim = 0.15 + 0.50 * t;   /* 0.15 → 0.65 */
 
-    /* Adaptive adjustment: when flow is anomalous, reduce climatology weight
-       and increase dynamic methods (AR1+KNN), especially at medium leads */
+    /* Adaptive: anomalous conditions → more dynamic weight */
     var climShift = anomalyFactor * 0.15 * (1 - t*0.5);
     wClim = Math.max(0.05, wClim - climShift);
     wAR1 += climShift * 0.5;
     wKNN += climShift * 0.5;
 
-    /* Blend in log-space to prevent high-flow bias */
+    /* Dynamic: skill-based adjustment (±10% max shift) */
+    var skillTotal = ar1Skill + knnSkill + 0.5;
+    var dynAR1 = ar1Skill / skillTotal;
+    var dynKNN = knnSkill / skillTotal;
+    var dynClim = 0.5 / skillTotal;
+    /* Blend: 70% base weights + 30% skill-driven weights */
+    wAR1 = 0.70 * wAR1 + 0.30 * dynAR1 * (wAR1 + wKNN + wClim);
+    wKNN = 0.70 * wKNN + 0.30 * dynKNN * (1 - wClim * 0.70 / (wAR1 + wKNN + wClim));
+    /* Re-normalize */
+    var wSum = wAR1 + wKNN + wClim;
+    wAR1 /= wSum; wKNN /= wSum; wClim /= wSum;
+
+    /* Blend in log-space */
     var logAR1  = Math.log(Math.max(1, ar1[i]));
     var logKNN  = Math.log(Math.max(1, knnMedian[i]));
-    var logClim = Math.log(Math.max(1, seasonalQ[i]));
+    var logClim = Math.log(Math.max(1, targetQ[i]));
     var logBlend = wAR1 * logAR1 + wKNN * logKNN + wClim * logClim;
     blended.push(Math.exp(logBlend));
   }
 
   /* ================================================================
      WEATHER PERTURBATION — Season-aware temperature response
-
-     Spring (Mar-Jun): High sensitivity — snowmelt amplifies response
-     Summer (Jul-Sep): Moderate — evapotranspiration effects
-     Fall/Winter (Oct-Feb): Low — baseflow dominated, less temp-sensitive
      ================================================================ */
   var seasonalSensitivity;
   if (currentMonth >= 2 && currentMonth <= 5) {
-    seasonalSensitivity = { warm: 0.006, cool: 0.004 };  /* Spring: high */
+    seasonalSensitivity = { warm: 0.006, cool: 0.004 };
   } else if (currentMonth >= 6 && currentMonth <= 8) {
-    seasonalSensitivity = { warm: 0.003, cool: 0.002 };  /* Summer: moderate */
+    seasonalSensitivity = { warm: 0.003, cool: 0.002 };
   } else {
-    seasonalSensitivity = { warm: 0.002, cool: 0.001 };  /* Fall/Winter: low */
+    seasonalSensitivity = { warm: 0.002, cool: 0.001 };
   }
 
   var typicalMeanF = 45;
@@ -515,34 +661,35 @@ function computeForecastV4(site, recent, dailyStats, analogTraces, weather, warn
     var tmean = (weather[i] && !isNaN(weather[i].mean)) ? weather[i].mean : typicalMeanF;
     var tempDelta = tmean - typicalMeanF;
     var pctAdj = tempDelta > 0 ? tempDelta * seasonalSensitivity.warm : tempDelta * seasonalSensitivity.cool;
-    /* Dampen weather perturbation at longer leads (less reliable) */
-    var leadDampen = 1 - (i / horizon) * 0.6;  /* 1.0 at day 1, 0.4 at day 14 */
+    var leadDampen = 1 - (i / horizon) * 0.6;
     blended[i] *= (1 + pctAdj * leadDampen);
-    /* Rain events: attenuated pulse */
     var precip = (weather[i] && weather[i].precipIn) ? weather[i].precipIn : 0;
     if (precip > 0.1 && tmean > 32) {
       blended[i] += precip * currentQ * 0.015 * leadDampen;
     }
   }
 
-  /* Adaptive smoothing: light at short leads (preserve signal), heavier at long leads */
+  /* Adaptive smoothing in log-space (prevents magnitude-dependent smoothing artifacts) */
   var smoothed = [];
+  var logBlended = blended.map(function(v) { return Math.log(Math.max(1, v)); });
   for (var i = 0; i < horizon; i++) {
+    var logSmooth;
     if (i <= 2) {
-      /* Days 1-3: 3-point smooth (preserve short-term signal) */
-      if (i === 0) smoothed.push((blended[0]*2 + blended[1]) / 3);
-      else if (i === horizon-1) smoothed.push((blended[i-1] + blended[i]*2) / 3);
-      else smoothed.push((blended[i-1] + blended[i] + blended[i+1]) / 3);
+      /* Days 1-3: 3-point smooth */
+      if (i === 0) logSmooth = (logBlended[0]*2 + logBlended[1]) / 3;
+      else if (i === horizon-1) logSmooth = (logBlended[i-1] + logBlended[i]*2) / 3;
+      else logSmooth = (logBlended[i-1] + logBlended[i] + logBlended[i+1]) / 3;
     } else {
-      /* Days 4+: 5-point smooth where possible (reduce noise at longer leads) */
+      /* Days 4+: 5-point smooth */
       if (i >= 2 && i < horizon-2) {
-        smoothed.push((blended[i-2] + blended[i-1] + blended[i] + blended[i+1] + blended[i+2]) / 5);
+        logSmooth = (logBlended[i-2] + logBlended[i-1] + logBlended[i] + logBlended[i+1] + logBlended[i+2]) / 5;
       } else if (i === horizon-2) {
-        smoothed.push((blended[i-1] + blended[i] + blended[i+1]) / 3);
+        logSmooth = (logBlended[i-1] + logBlended[i] + logBlended[i+1]) / 3;
       } else {
-        smoothed.push((blended[i-1] + blended[i]*2) / 3);
+        logSmooth = (logBlended[i-1] + logBlended[i]*2) / 3;
       }
     }
+    smoothed.push(Math.max(1, Math.exp(logSmooth)));
   }
 
   /* Floor at 1 cfs */

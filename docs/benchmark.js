@@ -190,9 +190,10 @@ async function runHindcast(siteNo, forecastDate, dailyStats, nAnalogYears) {
   if (recent.length < 14) throw new Error('Insufficient data for ' + isoDate(fd));
 
   var q = recent.map(function(r) { return r.q; });
-  var currentQ = q[q.length - 1];
+  var n = q.length;
+  var currentQ = q[n - 1];
 
-  /* Fetch actual observed flows for the 14 days after forecastDate (the "truth") */
+  /* Fetch actual observed flows for the 14 days after forecastDate */
   var actualStart = new Date(fd); actualStart.setDate(actualStart.getDate() + 1);
   var actualEnd = new Date(fd); actualEnd.setDate(actualEnd.getDate() + horizon);
   var actualData = await fetchDischarge(siteNo, actualStart, actualEnd);
@@ -201,27 +202,115 @@ async function runHindcast(siteNo, forecastDate, dailyStats, nAnalogYears) {
   /* Build KNN analog traces */
   var analogTraces = await buildAnalogTraces(siteNo, fd, q, nAnalogYears);
 
-  /* ---- Run each method ---- */
+  /* ---- Flow regime detection ---- */
+  var last7 = q.slice(-7);
+  var slope7 = linearSlope(last7) / Math.max(1, currentQ);
+  var regime = Math.abs(slope7) < 0.005 ? 0 : (slope7 > 0 ? 1 : -1);
 
-  /* Method 1: AR(1) in log-space */
+  /* ---- Retrospective bias correction ---- */
+  var biasFactor = 1.0;
+  if (n >= 21 && dailyStats) {
+    var biasLogErrs = [];
+    for (var b = 7; b >= 1; b--) {
+      var bIdx = n - 1 - b;
+      if (bIdx < 1) continue;
+      var bDate = new Date(fd); bDate.setDate(bDate.getDate() - b);
+      var bKey = pad2(bDate.getMonth()+1) + '-' + pad2(bDate.getDate());
+      var bSeasonal = (dailyStats[bKey] && dailyStats[bKey].p50 != null) ? dailyStats[bKey].p50 : q[bIdx];
+      var predLog = 0.93 * Math.log(Math.max(1, q[bIdx-1])) + 0.07 * Math.log(Math.max(1, bSeasonal));
+      var actualLog = Math.log(Math.max(1, q[bIdx]));
+      biasLogErrs.push(actualLog - predLog);
+    }
+    if (biasLogErrs.length >= 3) {
+      var sortedErrs = biasLogErrs.slice().sort(function(a,b){return a-b;});
+      var medErr = sortedErrs[Math.floor(sortedErrs.length/2)];
+      biasFactor = Math.exp(Math.max(-0.15, Math.min(0.15, medErr)));
+    }
+  }
+
+  /* ---- Phi estimation with regime adjustment ---- */
   var phi = fitPhi(q);
-  var seasonalQ = getSeasonalQ(fd, horizon, dailyStats, currentQ);
-  var ar1 = runAR1(currentQ, phi, seasonalQ, horizon);
+  var phiAdj = phi;
+  if (regime === 1) phiAdj = Math.min(0.99, phi + 0.02);
+  else if (regime === 0) phiAdj = Math.max(0.80, phi - 0.01);
 
-  /* Method 2: KNN analog ensemble */
+  /* ---- Seasonal data with percentile anchoring ---- */
+  var seasonalQ = [], seasonalP25 = [], seasonalP75 = [];
+  for (var i = 0; i < horizon; i++) {
+    var fDate = new Date(fd); fDate.setDate(fDate.getDate() + i + 1);
+    var key = pad2(fDate.getMonth()+1) + '-' + pad2(fDate.getDate());
+    var ds = dailyStats && dailyStats[key];
+    seasonalQ.push(ds && ds.p50 != null ? ds.p50 : currentQ);
+    seasonalP25.push(ds && ds.p25 != null ? ds.p25 : currentQ * 0.7);
+    seasonalP75.push(ds && ds.p75 != null ? ds.p75 : currentQ * 1.3);
+  }
+
+  /* Percentile-anchored target */
+  var todayKey = pad2(fd.getMonth()+1) + '-' + pad2(fd.getDate());
+  var todayP50 = (dailyStats && dailyStats[todayKey] && dailyStats[todayKey].p50 != null) ? dailyStats[todayKey].p50 : currentQ;
+  var todayP25 = (dailyStats && dailyStats[todayKey] && dailyStats[todayKey].p25 != null) ? dailyStats[todayKey].p25 : currentQ * 0.7;
+  var todayP75 = (dailyStats && dailyStats[todayKey] && dailyStats[todayKey].p75 != null) ? dailyStats[todayKey].p75 : currentQ * 1.3;
+
+  var pctilePos = 0.5;
+  if (currentQ <= todayP25) pctilePos = 0.25;
+  else if (currentQ >= todayP75) pctilePos = 0.75;
+  else if (currentQ < todayP50) pctilePos = 0.25 + 0.25 * (currentQ - todayP25) / Math.max(1, todayP50 - todayP25);
+  else pctilePos = 0.50 + 0.25 * (currentQ - todayP50) / Math.max(1, todayP75 - todayP50);
+
+  var targetQ = [];
+  for (var i = 0; i < horizon; i++) {
+    var t = i / (horizon - 1);
+    var effectivePctile = pctilePos + (0.5 - pctilePos) * t * 0.7;
+    if (effectivePctile <= 0.5) {
+      var w = Math.max(0, Math.min(1, (effectivePctile - 0.25) / 0.25));
+      targetQ.push(seasonalP25[i] + w * (seasonalQ[i] - seasonalP25[i]));
+    } else {
+      var w = Math.max(0, Math.min(1, (effectivePctile - 0.50) / 0.25));
+      targetQ.push(seasonalQ[i] + w * (seasonalP75[i] - seasonalQ[i]));
+    }
+  }
+
+  /* ---- Method 1: Momentum-aware AR(1) with bias correction ---- */
+  var ar1 = [];
+  var prevLogQ = Math.log(Math.max(1, currentQ));
+  for (var i = 0; i < horizon; i++) {
+    var logTarget = Math.log(Math.max(1, targetQ[i]));
+    var effPhi = i < 3 ? phiAdj : phi;
+    var logF = effPhi * prevLogQ + (1 - effPhi) * logTarget;
+    var bcDamp = Math.max(0, 1 - i * 0.12);
+    ar1.push(Math.exp(logF) * (1 + (biasFactor - 1) * bcDamp));
+    prevLogQ = logF;
+  }
+
+  /* ---- Method 2: KNN analog ensemble ---- */
   var knn = runKNN(currentQ, analogTraces, horizon);
 
-  /* Method 3: Seasonal climatology (p50) */
+  /* ---- Method 3: Climatology (p50) ---- */
   var clim = seasonalQ.slice();
 
-  /* Method 4: Persistence baseline (just repeat current Q) */
+  /* ---- Persistence baseline ---- */
   var persist = [];
   for (var i = 0; i < horizon; i++) persist.push(currentQ);
 
-  /* Adaptive blended forecast in log-space (matches tuned production model) */
-  var todayKey = pad2(fd.getMonth()+1) + '-' + pad2(fd.getDate());
-  var todayP50 = (dailyStats && dailyStats[todayKey] && dailyStats[todayKey].p50 != null)
-    ? dailyStats[todayKey].p50 : currentQ;
+  /* ---- Dynamic method weighting ---- */
+  var ar1Skill = 1.0, knnSkill = 1.0;
+  if (n >= 14 && dailyStats) {
+    var ar1Errs = [];
+    for (var b = 7; b >= 1; b--) {
+      var bIdx = n - 1 - b;
+      if (bIdx < 1) continue;
+      var bDate = new Date(fd); bDate.setDate(bDate.getDate() - b);
+      var bKey = pad2(bDate.getMonth()+1) + '-' + pad2(bDate.getDate());
+      var bSeas = (dailyStats[bKey] && dailyStats[bKey].p50 != null) ? dailyStats[bKey].p50 : q[bIdx];
+      var ar1Pred = Math.exp(phi * Math.log(Math.max(1, q[bIdx-1])) + (1-phi) * Math.log(Math.max(1, bSeas)));
+      ar1Errs.push(Math.abs(Math.log(ar1Pred) - Math.log(Math.max(1, q[bIdx]))));
+    }
+    var ar1MeanErr = ar1Errs.length > 0 ? ar1Errs.reduce(function(a,b){return a+b;},0) / ar1Errs.length : 0.1;
+    ar1Skill = 1 / (1 + ar1MeanErr * 5);
+    knnSkill = analogTraces && analogTraces.length >= 3 ? 1 / (1 + ar1MeanErr * 3) : 0.5;
+  }
+
+  /* ---- Adaptive blending in log-space ---- */
   var logAnomaly = Math.abs(Math.log(Math.max(1,currentQ)) - Math.log(Math.max(1,todayP50)));
   var anomalyFactor = Math.min(1, logAnomaly / 1.0);
 
@@ -235,24 +324,34 @@ async function runHindcast(siteNo, forecastDate, dailyStats, nAnalogYears) {
     wClim = Math.max(0.05, wClim - climShift);
     wAR1 += climShift * 0.5;
     wKNN += climShift * 0.5;
+    var skillTotal = ar1Skill + knnSkill + 0.5;
+    var dynAR1 = ar1Skill / skillTotal;
+    var dynKNN = knnSkill / skillTotal;
+    wAR1 = 0.70 * wAR1 + 0.30 * dynAR1 * (wAR1 + wKNN + wClim);
+    wKNN = 0.70 * wKNN + 0.30 * dynKNN * (1 - wClim * 0.70 / (wAR1 + wKNN + wClim));
+    var wSum = wAR1 + wKNN + wClim;
+    wAR1 /= wSum; wKNN /= wSum; wClim /= wSum;
     var logAR1  = Math.log(Math.max(1, ar1[i]));
     var logKNN  = Math.log(Math.max(1, knn[i]));
-    var logClim = Math.log(Math.max(1, clim[i]));
+    var logClim = Math.log(Math.max(1, targetQ[i]));
     blended.push(Math.max(1, Math.exp(wAR1*logAR1 + wKNN*logKNN + wClim*logClim)));
   }
 
-  /* Adaptive smoothing: 3-point for short leads, 5-point for longer */
+  /* ---- Smoothing in log-space ---- */
   var smoothed = [];
+  var logB = blended.map(function(v){return Math.log(Math.max(1,v));});
   for (var i = 0; i < horizon; i++) {
+    var ls;
     if (i <= 2) {
-      if (i === 0) smoothed.push((blended[0]*2 + blended[1]) / 3);
-      else if (i === horizon-1) smoothed.push((blended[i-1] + blended[i]*2) / 3);
-      else smoothed.push((blended[i-1] + blended[i] + blended[i+1]) / 3);
+      if (i === 0) ls = (logB[0]*2 + logB[1]) / 3;
+      else if (i === horizon-1) ls = (logB[i-1] + logB[i]*2) / 3;
+      else ls = (logB[i-1] + logB[i] + logB[i+1]) / 3;
     } else {
-      if (i >= 2 && i < horizon-2) smoothed.push((blended[i-2]+blended[i-1]+blended[i]+blended[i+1]+blended[i+2])/5);
-      else if (i === horizon-2) smoothed.push((blended[i-1]+blended[i]+blended[i+1])/3);
-      else smoothed.push((blended[i-1]+blended[i]*2)/3);
+      if (i >= 2 && i < horizon-2) ls = (logB[i-2]+logB[i-1]+logB[i]+logB[i+1]+logB[i+2])/5;
+      else if (i === horizon-2) ls = (logB[i-1]+logB[i]+logB[i+1])/3;
+      else ls = (logB[i-1]+logB[i]*2)/3;
     }
+    smoothed.push(Math.max(1, Math.exp(ls)));
   }
 
   /* Truncate actual to match available length */
@@ -265,7 +364,6 @@ async function runHindcast(siteNo, forecastDate, dailyStats, nAnalogYears) {
   var ar1Slice = ar1.slice(0, len);
   var knnSlice = knn.slice(0, len);
 
-  /* Compute metrics for each method */
   var metrics = {
     blended: Metrics.all(obsSlice, predSlice, climSlice, persistSlice),
     ar1: Metrics.all(obsSlice, ar1Slice, climSlice, persistSlice),
@@ -274,7 +372,6 @@ async function runHindcast(siteNo, forecastDate, dailyStats, nAnalogYears) {
     persist: Metrics.all(obsSlice, persistSlice, climSlice, persistSlice),
   };
 
-  /* Lead-time breakdown: metrics at day 1-3, 4-7, 8-14 */
   var leadMetrics = {};
   var ranges = { 'day1_3': [0,3], 'day4_7': [3,7], 'day8_14': [7,14] };
   for (var rname in ranges) {
@@ -301,7 +398,7 @@ async function runHindcast(siteNo, forecastDate, dailyStats, nAnalogYears) {
   };
 }
 
-/* ---- Model components (shared with production model) ---- */
+/* ---- Model components ---- */
 
 function fitPhi(q) {
   var n = q.length;
@@ -320,30 +417,6 @@ function fitPhi(q) {
     den+=(pairs[i][0]-mx)*(pairs[i][0]-mx);
   }
   return den > 0 ? Math.max(0.80, Math.min(0.98, num/den)) : 0.95;
-}
-
-function getSeasonalQ(baseDate, horizon, dailyStats, fallback) {
-  var result = [];
-  for (var i = 0; i < horizon; i++) {
-    var fDate = new Date(baseDate); fDate.setDate(fDate.getDate() + i + 1);
-    var key = pad2(fDate.getMonth()+1) + '-' + pad2(fDate.getDate());
-    if (dailyStats && dailyStats[key] && dailyStats[key].p50 != null) {
-      result.push(dailyStats[key].p50);
-    } else { result.push(fallback); }
-  }
-  return result;
-}
-
-function runAR1(currentQ, phi, seasonalQ, horizon) {
-  var result = [];
-  var prev = Math.log(Math.max(1, currentQ));
-  for (var i = 0; i < horizon; i++) {
-    var logS = Math.log(Math.max(1, seasonalQ[i]));
-    var logF = phi * prev + (1-phi) * logS;
-    result.push(Math.exp(logF));
-    prev = logF;
-  }
-  return result;
 }
 
 function runKNN(currentQ, analogTraces, horizon) {
@@ -368,9 +441,24 @@ async function buildAnalogTraces(siteNo, forecastDate, recentQ, nYears) {
   var last7 = recentQ.slice(-7);
   var slope = linearSlope(last7) / currentQ;
 
+  /* Acceleration and variability features */
+  var accel = 0;
+  if (recentQ.length >= 14) {
+    var prev7 = recentQ.slice(-14, -7);
+    var prevSlope = linearSlope(prev7) / Math.max(1, recentQ[recentQ.length-8]);
+    accel = slope - prevSlope;
+  }
+  var cv = 0;
+  if (recentQ.length >= 14) {
+    var r14 = recentQ.slice(-14);
+    var m14 = r14.reduce(function(a,b){return a+b;},0) / r14.length;
+    var v14 = r14.reduce(function(a,b){return a+(b-m14)*(b-m14);},0) / r14.length;
+    cv = m14 > 0 ? Math.sqrt(v14) / m14 : 0;
+  }
+
   var fetches = [];
   for (var y = 1; y <= nYears; y++) {
-    var start = new Date(forecastDate.getFullYear()-y, forecastDate.getMonth(), forecastDate.getDate()-10);
+    var start = new Date(forecastDate.getFullYear()-y, forecastDate.getMonth(), forecastDate.getDate()-14);
     var end   = new Date(forecastDate.getFullYear()-y, forecastDate.getMonth(), forecastDate.getDate()+16);
     var url = USGS_DV + '?format=json&sites='+siteNo+'&parameterCd=00060&startDT='+isoDate(start)+'&endDT='+isoDate(end);
     fetches.push(fetch(url).then(function(r){return r.json();}).catch(function(){return null;}));
@@ -384,15 +472,32 @@ async function buildAnalogTraces(siteNo, forecastDate, recentQ, nYears) {
     try { ts = data.value.timeSeries[0].values[0].value; } catch(e){continue;}
     var flows = ts.map(function(v){return parseFloat(v.value);}).filter(function(v){return !isNaN(v)&&v>0;});
     if (flows.length < 20) continue;
-    var anchorIdx = Math.min(10, flows.length-15);
-    if (anchorIdx < 3) continue;
+    var anchorIdx = Math.min(14, flows.length-15);
+    if (anchorIdx < 7) continue;
     var anchorQ = flows[anchorIdx];
     if (anchorQ <= 0) continue;
+
+    var flowDiff = Math.log(currentQ/anchorQ);
     var hist7 = flows.slice(Math.max(0,anchorIdx-6), anchorIdx+1);
     var histSlope = linearSlope(hist7) / anchorQ;
-    var flowDiff = Math.log(currentQ/anchorQ);
     var slopeDiff = slope - histSlope;
-    var dist = Math.sqrt(4*flowDiff*flowDiff + slopeDiff*slopeDiff);
+
+    var histAccel = 0;
+    if (anchorIdx >= 14) {
+      var hp7 = flows.slice(anchorIdx-13, anchorIdx-6);
+      var hps = linearSlope(hp7) / Math.max(1, flows[anchorIdx-7]);
+      histAccel = histSlope - hps;
+    }
+    var accelDiff = accel - histAccel;
+
+    var hr14 = flows.slice(Math.max(0,anchorIdx-13), anchorIdx+1);
+    var hm = hr14.reduce(function(a,b){return a+b;},0) / hr14.length;
+    var hv = hr14.reduce(function(a,b){return a+(b-hm)*(b-hm);},0) / hr14.length;
+    var hcv = hm > 0 ? Math.sqrt(hv) / hm : 0;
+    var cvDiff = cv - hcv;
+
+    var dist = Math.sqrt(5.0*flowDiff*flowDiff + 1.5*slopeDiff*slopeDiff + 0.8*accelDiff*accelDiff + 0.5*cvDiff*cvDiff);
+
     var trace = [];
     for (var d=1;d<=14;d++){
       var idx=anchorIdx+d;
@@ -405,19 +510,9 @@ async function buildAnalogTraces(siteNo, forecastDate, recentQ, nYears) {
   var K = Math.min(7, candidates.length);
   var topK = candidates.slice(0, K);
   var totalW = 0;
-  for (var i=0;i<K;i++){topK[i].weight=1/(topK[i].distance+0.01);totalW+=topK[i].weight;}
+  for (var i=0;i<K;i++){topK[i].weight=1/((topK[i].distance+0.01)*(topK[i].distance+0.01));totalW+=topK[i].weight;}
   for (var i=0;i<K;i++) topK[i].weight/=totalW;
   return topK;
-}
-
-function smooth3(arr) {
-  var out = [];
-  for (var i=0;i<arr.length;i++){
-    if(i===0) out.push((arr[0]*2+arr[1])/3);
-    else if(i===arr.length-1) out.push((arr[i-1]+arr[i]*2)/3);
-    else out.push((arr[i-1]+arr[i]+arr[i+1])/3);
-  }
-  return out;
 }
 
 /* ============================================================
