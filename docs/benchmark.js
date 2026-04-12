@@ -218,18 +218,42 @@ async function runHindcast(siteNo, forecastDate, dailyStats, nAnalogYears) {
   var persist = [];
   for (var i = 0; i < horizon; i++) persist.push(currentQ);
 
-  /* Blended forecast (same weights as production model) */
+  /* Adaptive blended forecast in log-space (matches tuned production model) */
+  var todayKey = pad2(fd.getMonth()+1) + '-' + pad2(fd.getDate());
+  var todayP50 = (dailyStats && dailyStats[todayKey] && dailyStats[todayKey].p50 != null)
+    ? dailyStats[todayKey].p50 : currentQ;
+  var logAnomaly = Math.abs(Math.log(Math.max(1,currentQ)) - Math.log(Math.max(1,todayP50)));
+  var anomalyFactor = Math.min(1, logAnomaly / 1.0);
+
   var blended = [];
   for (var i = 0; i < horizon; i++) {
     var t = i / (horizon - 1);
     var wAR1  = 0.50 - 0.40 * t;
-    var wKNN  = 0.40 - 0.10 * t;
-    var wClim = 0.10 + 0.50 * t;
-    blended.push(Math.max(1, wAR1*ar1[i] + wKNN*knn[i] + wClim*clim[i]));
+    var wKNN  = 0.35 - 0.10 * t;
+    var wClim = 0.15 + 0.50 * t;
+    var climShift = anomalyFactor * 0.15 * (1 - t*0.5);
+    wClim = Math.max(0.05, wClim - climShift);
+    wAR1 += climShift * 0.5;
+    wKNN += climShift * 0.5;
+    var logAR1  = Math.log(Math.max(1, ar1[i]));
+    var logKNN  = Math.log(Math.max(1, knn[i]));
+    var logClim = Math.log(Math.max(1, clim[i]));
+    blended.push(Math.max(1, Math.exp(wAR1*logAR1 + wKNN*logKNN + wClim*logClim)));
   }
 
-  /* Smooth */
-  var smoothed = smooth3(blended);
+  /* Adaptive smoothing: 3-point for short leads, 5-point for longer */
+  var smoothed = [];
+  for (var i = 0; i < horizon; i++) {
+    if (i <= 2) {
+      if (i === 0) smoothed.push((blended[0]*2 + blended[1]) / 3);
+      else if (i === horizon-1) smoothed.push((blended[i-1] + blended[i]*2) / 3);
+      else smoothed.push((blended[i-1] + blended[i] + blended[i+1]) / 3);
+    } else {
+      if (i >= 2 && i < horizon-2) smoothed.push((blended[i-2]+blended[i-1]+blended[i]+blended[i+1]+blended[i+2])/5);
+      else if (i === horizon-2) smoothed.push((blended[i-1]+blended[i]+blended[i+1])/3);
+      else smoothed.push((blended[i-1]+blended[i]*2)/3);
+    }
+  }
 
   /* Truncate actual to match available length */
   var len = Math.min(smoothed.length, actual.length);
@@ -295,7 +319,7 @@ function fitPhi(q) {
     num+=(pairs[i][0]-mx)*(pairs[i][1]-my);
     den+=(pairs[i][0]-mx)*(pairs[i][0]-mx);
   }
-  return den > 0 ? Math.max(0.7, Math.min(0.99, num/den)) : 0.95;
+  return den > 0 ? Math.max(0.80, Math.min(0.98, num/den)) : 0.95;
 }
 
 function getSeasonalQ(baseDate, horizon, dailyStats, fallback) {
@@ -378,7 +402,7 @@ async function buildAnalogTraces(siteNo, forecastDate, recentQ, nYears) {
   }
   if (candidates.length < 2) return null;
   candidates.sort(function(a,b){return a.distance-b.distance;});
-  var K = Math.min(5, candidates.length);
+  var K = Math.min(7, candidates.length);
   var topK = candidates.slice(0, K);
   var totalW = 0;
   for (var i=0;i<K;i++){topK[i].weight=1/(topK[i].distance+0.01);totalW+=topK[i].weight;}
@@ -462,7 +486,7 @@ async function runBenchmarkSuite(sites, testDates, onProgress) {
     for (var d = 0; d < testDates.length; d++) {
       var testDate = testDates[d];
       try {
-        var result = await runHindcast(site.id, testDate, siteResults[site.id].dailyStats, 10);
+        var result = await runHindcast(site.id, testDate, siteResults[site.id].dailyStats, 15);
         result.siteName = site.name;
         result.siteId = site.id;
         siteResults[site.id].hindcasts.push(result);

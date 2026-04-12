@@ -109,7 +109,7 @@ async function runForecast() {
 
     renderSteps(steps, 3);
     var analogTraces = null;
-    try { analogTraces = await fetchAnalogTraces(siteNo, recent, 10); }
+    try { analogTraces = await fetchAnalogTraces(siteNo, recent, 15); }
     catch(e) { warnings.push('Historical analog data unavailable.'); }
 
     renderSteps(steps, 4);
@@ -257,9 +257,9 @@ async function fetchAnalogTraces(siteNo, recent, nYears) {
 
   if (candidates.length < 3) return null;
 
-  /* Sort by distance and take K=5 nearest */
+  /* Sort by distance and take K=7 nearest (more analogs → smoother ensemble) */
   candidates.sort(function(a,b) { return a.distance - b.distance; });
-  var K = Math.min(5, candidates.length);
+  var K = Math.min(7, candidates.length);
   var topK = candidates.slice(0, K);
 
   /* Weight by inverse distance */
@@ -362,18 +362,19 @@ function computeForecastV4(site, recent, dailyStats, analogTraces, weather, warn
   var n = q.length;
   var currentQ = n > 0 ? q[n-1] : 100;
   var today = new Date(); today.setHours(0,0,0,0);
+  var currentMonth = today.getMonth(); /* 0-11 */
 
   /* ================================================================
      METHOD 1: AR(1) persistence in log-space
-     
+
      ln(Q_{t+1}) = phi * ln(Q_t) + (1-phi) * ln(Q_seasonal)
-     
-     This is the most accurate method for 1-3 day lead times.
-     It naturally reverts toward the seasonal median over time.
+
+     Most accurate at 1-3 day lead times. Naturally reverts toward
+     the seasonal median. Phi estimated via Yule-Walker in log-space.
+     Bounds tightened to 0.80-0.98 per operational hydrology literature.
      ================================================================ */
-  var phi = 0.95;  /* default autocorrelation */
+  var phi = 0.95;
   if (n >= 14) {
-    /* Estimate phi from recent data */
     var logQ = [];
     for (var i = 0; i < n; i++) logQ.push(Math.log(Math.max(1, q[i])));
     var pairs = [];
@@ -387,7 +388,7 @@ function computeForecastV4(site, recent, dailyStats, analogTraces, weather, warn
         num += (pairs[i][0]-mx)*(pairs[i][1]-my);
         den += (pairs[i][0]-mx)*(pairs[i][0]-mx);
       }
-      if (den > 0) phi = Math.max(0.7, Math.min(0.99, num/den));
+      if (den > 0) phi = Math.max(0.80, Math.min(0.98, num/den));
     }
   }
 
@@ -399,7 +400,7 @@ function computeForecastV4(site, recent, dailyStats, analogTraces, weather, warn
     if (dailyStats && dailyStats[key] && dailyStats[key].p50 != null) {
       seasonalQ.push(dailyStats[key].p50);
     } else {
-      seasonalQ.push(currentQ);  /* fallback */
+      seasonalQ.push(currentQ);
     }
   }
 
@@ -415,12 +416,12 @@ function computeForecastV4(site, recent, dailyStats, analogTraces, weather, warn
 
   /* ================================================================
      METHOD 2: KNN Analog ensemble
-     
+
      Weighted average of the K nearest historical traces,
      scaled by current flow level.
      ================================================================ */
   var knnMedian = [];
-  var knnTraces = [];  /* individual traces for uncertainty */
+  var knnTraces = [];
   if (analogTraces && analogTraces.length >= 3) {
     for (var d = 0; d < horizon; d++) {
       var weightedSum = 0;
@@ -435,7 +436,6 @@ function computeForecastV4(site, recent, dailyStats, analogTraces, weather, warn
       knnTraces.push(traceVals);
     }
   } else {
-    /* No analogs — use AR(1) as fallback */
     for (var d = 0; d < horizon; d++) {
       knnMedian.push(ar1[d]);
       knnTraces.push([ar1[d]]);
@@ -443,58 +443,109 @@ function computeForecastV4(site, recent, dailyStats, analogTraces, weather, warn
   }
 
   /* ================================================================
-     METHOD 3: Climatological seasonal trajectory
-     
-     Simply follow the p50 (median) for each day-of-year.
-     This is the "no-skill" baseline.
+     METHOD 3: Climatological seasonal trajectory (p50 for each DOY)
      ================================================================ */
   /* seasonalQ already computed above */
 
   /* ================================================================
-     BLENDING: Combine methods with weights that shift over time
-     
-     Short term (day 1-3): 50% AR(1) + 40% KNN + 10% climatology
-     Medium term (day 4-7): 25% AR(1) + 45% KNN + 30% climatology
-     Long term (day 8-14): 10% AR(1) + 30% KNN + 60% climatology
+     ADAPTIVE BLENDING in log-space
+
+     Key improvements over simple linear blending:
+     1. Blend in log-space to prevent high-flow bias
+     2. Adapt weights based on flow anomaly — when current conditions
+        are far from seasonal norm, weight dynamic methods higher;
+        when near normal, trust climatology more
+     3. Refined weight curves based on operational forecast research
+
+     Base weights:
+       Short (day 1-3): 50% AR(1) + 35% KNN + 15% climatology
+       Medium (day 4-7): 30% AR(1) + 35% KNN + 35% climatology
+       Long (day 8-14): 10% AR(1) + 25% KNN + 65% climatology
      ================================================================ */
+  /* Compute flow anomaly: how far current flow is from seasonal */
+  var todayKey = pad2(today.getMonth()+1) + '-' + pad2(today.getDate());
+  var todayP50 = (dailyStats && dailyStats[todayKey] && dailyStats[todayKey].p50 != null)
+    ? dailyStats[todayKey].p50 : currentQ;
+  var logAnomaly = Math.abs(Math.log(Math.max(1,currentQ)) - Math.log(Math.max(1,todayP50)));
+  /* anomalyFactor: 0 when at median, approaches 1 when far from median */
+  var anomalyFactor = Math.min(1, logAnomaly / 1.0);
+
   var blended = [];
   for (var i = 0; i < horizon; i++) {
     var t = i / (horizon - 1);  /* 0 at day 1, 1 at day 14 */
+
+    /* Base weights */
     var wAR1  = 0.50 - 0.40 * t;   /* 0.50 → 0.10 */
-    var wKNN  = 0.40 - 0.10 * t;   /* 0.40 → 0.30 */
-    var wClim = 0.10 + 0.50 * t;   /* 0.10 → 0.60 */
-    blended.push(wAR1 * ar1[i] + wKNN * knnMedian[i] + wClim * seasonalQ[i]);
+    var wKNN  = 0.35 - 0.10 * t;   /* 0.35 → 0.25 */
+    var wClim = 0.15 + 0.50 * t;   /* 0.15 → 0.65 */
+
+    /* Adaptive adjustment: when flow is anomalous, reduce climatology weight
+       and increase dynamic methods (AR1+KNN), especially at medium leads */
+    var climShift = anomalyFactor * 0.15 * (1 - t*0.5);
+    wClim = Math.max(0.05, wClim - climShift);
+    wAR1 += climShift * 0.5;
+    wKNN += climShift * 0.5;
+
+    /* Blend in log-space to prevent high-flow bias */
+    var logAR1  = Math.log(Math.max(1, ar1[i]));
+    var logKNN  = Math.log(Math.max(1, knnMedian[i]));
+    var logClim = Math.log(Math.max(1, seasonalQ[i]));
+    var logBlend = wAR1 * logAR1 + wKNN * logKNN + wClim * logClim;
+    blended.push(Math.exp(logBlend));
   }
 
   /* ================================================================
-     WEATHER PERTURBATION: Adjust for forecast temp vs seasonal norm
-     
-     Warmer than seasonal average → nudge up (enhanced melt)
-     Cooler → nudge down (reduced melt)
+     WEATHER PERTURBATION — Season-aware temperature response
+
+     Spring (Mar-Jun): High sensitivity — snowmelt amplifies response
+     Summer (Jul-Sep): Moderate — evapotranspiration effects
+     Fall/Winter (Oct-Feb): Low — baseflow dominated, less temp-sensitive
      ================================================================ */
+  var seasonalSensitivity;
+  if (currentMonth >= 2 && currentMonth <= 5) {
+    seasonalSensitivity = { warm: 0.006, cool: 0.004 };  /* Spring: high */
+  } else if (currentMonth >= 6 && currentMonth <= 8) {
+    seasonalSensitivity = { warm: 0.003, cool: 0.002 };  /* Summer: moderate */
+  } else {
+    seasonalSensitivity = { warm: 0.002, cool: 0.001 };  /* Fall/Winter: low */
+  }
+
   var typicalMeanF = 45;
   for (var i = 0; i < horizon; i++) {
     var tmean = (weather[i] && !isNaN(weather[i].mean)) ? weather[i].mean : typicalMeanF;
     var tempDelta = tmean - typicalMeanF;
-    /* Scale: each degree above normal → +0.4% flow, below → -0.25% */
-    var pctAdj = tempDelta > 0 ? tempDelta * 0.004 : tempDelta * 0.0025;
-    blended[i] *= (1 + pctAdj);
-    /* Rain events: small pulse */
+    var pctAdj = tempDelta > 0 ? tempDelta * seasonalSensitivity.warm : tempDelta * seasonalSensitivity.cool;
+    /* Dampen weather perturbation at longer leads (less reliable) */
+    var leadDampen = 1 - (i / horizon) * 0.6;  /* 1.0 at day 1, 0.4 at day 14 */
+    blended[i] *= (1 + pctAdj * leadDampen);
+    /* Rain events: attenuated pulse */
     var precip = (weather[i] && weather[i].precipIn) ? weather[i].precipIn : 0;
     if (precip > 0.1 && tmean > 32) {
-      blended[i] += precip * currentQ * 0.02;  /* ~2% boost per inch of rain */
+      blended[i] += precip * currentQ * 0.015 * leadDampen;
     }
   }
 
-  /* Smooth with 3-point moving average */
+  /* Adaptive smoothing: light at short leads (preserve signal), heavier at long leads */
   var smoothed = [];
   for (var i = 0; i < horizon; i++) {
-    if (i === 0) smoothed.push((blended[0]*2 + blended[1]) / 3);
-    else if (i === horizon-1) smoothed.push((blended[i-1] + blended[i]*2) / 3);
-    else smoothed.push((blended[i-1] + blended[i] + blended[i+1]) / 3);
+    if (i <= 2) {
+      /* Days 1-3: 3-point smooth (preserve short-term signal) */
+      if (i === 0) smoothed.push((blended[0]*2 + blended[1]) / 3);
+      else if (i === horizon-1) smoothed.push((blended[i-1] + blended[i]*2) / 3);
+      else smoothed.push((blended[i-1] + blended[i] + blended[i+1]) / 3);
+    } else {
+      /* Days 4+: 5-point smooth where possible (reduce noise at longer leads) */
+      if (i >= 2 && i < horizon-2) {
+        smoothed.push((blended[i-2] + blended[i-1] + blended[i] + blended[i+1] + blended[i+2]) / 5);
+      } else if (i === horizon-2) {
+        smoothed.push((blended[i-1] + blended[i] + blended[i+1]) / 3);
+      } else {
+        smoothed.push((blended[i-1] + blended[i]*2) / 3);
+      }
+    }
   }
 
-  /* Floor at zero */
+  /* Floor at 1 cfs */
   for (var i = 0; i < horizon; i++) smoothed[i] = Math.max(1, smoothed[i]);
 
   /* ================================================================

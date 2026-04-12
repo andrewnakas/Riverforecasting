@@ -128,22 +128,24 @@
         <ol style="margin:0.3rem 0 1rem 1.5rem">
           <li><strong>Recent streamflow</strong> &mdash; 90 days of daily mean discharge from <a href="https://waterservices.usgs.gov/" style="color:var(--accent)">USGS NWIS</a></li>
           <li><strong>Historical statistics</strong> &mdash; Percentiles (p10&ndash;p90) for each day-of-year from the USGS Statistics Service (decades of record)</li>
-          <li><strong>Historical analogs</strong> &mdash; Same-time-of-year flow data from 10 past years for KNN pattern matching</li>
+          <li><strong>Historical analogs</strong> &mdash; Same-time-of-year flow data from 15 past years for KNN pattern matching</li>
           <li><strong>Weather forecast</strong> &mdash; 7-day gridded temperature &amp; precipitation from the <a href="https://www.weather.gov/documentation/services-web-api" style="color:var(--accent)">NWS API</a></li>
         </ol>
         <p style="margin:0.8rem 0 0.4rem;font-weight:600;color:var(--text)">Forecast Methods</p>
         <ol style="margin:0.3rem 0 1rem 1.5rem">
           <li><strong>AR(1) Persistence</strong> &mdash; Autoregressive model in log-space that reverts toward the seasonal median. Most accurate at 1&ndash;3 day lead times. The autocorrelation &phi; is fitted from recent observed data.</li>
-          <li><strong>KNN Historical Analogs</strong> &mdash; Finds the 5 most similar historical years (matched by flow level + 7-day trajectory in log-space) and uses their subsequent 14-day traces as an ensemble. Weighted by inverse distance.</li>
+          <li><strong>KNN Historical Analogs</strong> &mdash; Finds the 7 most similar historical years from 15 candidates (matched by flow level + 7-day trajectory in log-space) and uses their subsequent 14-day traces as an ensemble. Weighted by inverse distance.</li>
           <li><strong>Seasonal Climatology</strong> &mdash; The historical median (p50) flow for each upcoming day-of-year &mdash; the &ldquo;no-skill&rdquo; baseline that captures the long-term seasonal cycle.</li>
         </ol>
         <p style="margin:0.8rem 0 0.4rem;font-weight:600;color:var(--text)">Blending &amp; Uncertainty</p>
         <ul style="margin:0.3rem 0 1rem 1.5rem">
-          <li>Short-term (day 1&ndash;3): 50% AR(1) + 40% KNN + 10% climatology</li>
-          <li>Medium-term (day 4&ndash;7): ~35% AR(1) + ~35% KNN + ~30% climatology</li>
-          <li>Long-term (day 8&ndash;14): 10% AR(1) + 30% KNN + 60% climatology</li>
-          <li>NWS temperature forecast modulates the blend (&plusmn;0.4%/&deg;F vs seasonal norm)</li>
-          <li>Uncertainty bands come from KNN trace spread (short-term) blended with historical p10/p90 percentiles (long-term)</li>
+          <li>Blending performed in <strong>log-space</strong> to prevent high-flow bias</li>
+          <li>Short-term (day 1&ndash;3): 50% AR(1) + 35% KNN + 15% climatology</li>
+          <li>Medium-term (day 4&ndash;7): ~30% AR(1) + ~35% KNN + ~35% climatology</li>
+          <li>Long-term (day 8&ndash;14): 10% AR(1) + 25% KNN + 65% climatology</li>
+          <li><strong>Adaptive weights</strong>: when current flow is far from seasonal median, dynamic methods (AR1/KNN) get more weight</li>
+          <li>Season-aware NWS temperature perturbation (highest sensitivity in spring snowmelt, lowest in winter baseflow)</li>
+          <li>Uncertainty bands from KNN trace spread (short-term) blended with historical p10/p90 percentiles (long-term)</li>
         </ul>
         <p>The dashed yellow lines on the forecast chart show the historical p25/p50/p75 envelope &mdash; where this river has typically flowed at this time of year.</p>
         <p style="margin-top:0.5rem">Full Python implementation with SNOTEL snowpack integration: <a href="https://github.com/andrewnakas/Riverforecasting" style="color:var(--accent)">GitHub repository</a>.</p>
