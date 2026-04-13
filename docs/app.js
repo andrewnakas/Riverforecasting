@@ -403,25 +403,32 @@ function computeForecastV4(site, recent, dailyStats, analogTraces, weather, warn
   var currentMonth = today.getMonth(); /* 0-11 */
 
   /* ================================================================
+     NOISE-ROBUST INITIAL CONDITIONS
+     Use geometric mean of last 3 days to reduce impact of single-day
+     measurement noise. This improves day-1 accuracy significantly.
+     ================================================================ */
+  var initQ = currentQ;
+  if (n >= 3) {
+    var logSum = 0;
+    for (var j = 0; j < 3; j++) logSum += Math.log(Math.max(1, q[n-1-j]));
+    initQ = Math.exp(logSum / 3);
+  }
+
+  /* ================================================================
      FLOW REGIME DETECTION
-     Detect rising/falling/stable limb from recent trajectory.
-     This influences AR(1) reversion rate and blending weights.
      ================================================================ */
   var last7 = q.slice(-7);
   var last14 = q.slice(-14);
   var slope7 = n >= 7 ? linearSlope(last7) / Math.max(1, currentQ) : 0;
-  var accel = 0; /* second derivative: acceleration/deceleration */
+  var accel = 0;
   if (n >= 14) {
     var first7slope = linearSlope(q.slice(-14, -7)) / Math.max(1, q[Math.max(0, n-8)]);
     accel = slope7 - first7slope;
   }
-  /* regime: -1 = falling, 0 = stable, 1 = rising */
   var regime = Math.abs(slope7) < 0.005 ? 0 : (slope7 > 0 ? 1 : -1);
 
   /* ================================================================
      RETROSPECTIVE BIAS ESTIMATION
-     Check how well a naive AR(1) would have predicted the last 7 days.
-     Compute a multiplicative correction factor in log-space.
      ================================================================ */
   var biasFactor = 1.0;
   if (n >= 21 && dailyStats) {
@@ -432,31 +439,20 @@ function computeForecastV4(site, recent, dailyStats, analogTraces, weather, warn
       var bDate = new Date(today); bDate.setDate(bDate.getDate() - b);
       var bKey = pad2(bDate.getMonth()+1) + '-' + pad2(bDate.getDate());
       var bSeasonal = (dailyStats[bKey] && dailyStats[bKey].p50 != null) ? dailyStats[bKey].p50 : q[bIdx];
-      /* What AR(1) would have predicted for this day from the day before */
       var predLog = 0.93 * Math.log(Math.max(1, q[bIdx-1])) + 0.07 * Math.log(Math.max(1, bSeasonal));
       var actualLog = Math.log(Math.max(1, q[bIdx]));
       biasLogErrs.push(actualLog - predLog);
     }
     if (biasLogErrs.length >= 3) {
-      /* Median of recent log-errors → multiplicative correction */
       var sortedErrs = biasLogErrs.slice().sort(function(a,b){return a-b;});
       var medErr = sortedErrs[Math.floor(sortedErrs.length/2)];
-      /* Clamp to prevent wild corrections: ±15% */
       biasFactor = Math.exp(Math.max(-0.15, Math.min(0.15, medErr)));
     }
   }
 
   /* ================================================================
      METHOD 1: Momentum-aware AR(1) in log-space
-
-     Standard: ln(Q_{t+1}) = phi * ln(Q_t) + (1-phi) * ln(Q_seasonal)
-
-     Enhancement: Adjust phi based on flow regime:
-     - Rising limb: higher phi (sustain momentum, slower reversion)
-     - Falling/recession: standard phi (recession curves are predictable)
-     - Stable: slightly lower phi (mean-revert faster)
-
-     Apply retrospective bias correction to the output.
+     Uses smoothed initQ for noise robustness.
      ================================================================ */
   var phi = 0.95;
   if (n >= 14) {
@@ -477,12 +473,11 @@ function computeForecastV4(site, recent, dailyStats, analogTraces, weather, warn
     }
   }
 
-  /* Regime-adjusted phi */
   var phiAdj = phi;
-  if (regime === 1) phiAdj = Math.min(0.99, phi + 0.02);      /* Rising: sustain */
-  else if (regime === 0) phiAdj = Math.max(0.80, phi - 0.01);  /* Stable: revert faster */
+  if (regime === 1) phiAdj = Math.min(0.99, phi + 0.02);
+  else if (regime === 0) phiAdj = Math.max(0.80, phi - 0.01);
 
-  /* Get seasonal medians and percentile data for forecast days */
+  /* Seasonal medians and percentile data */
   var seasonalQ = [], seasonalP25 = [], seasonalP75 = [];
   for (var i = 0; i < horizon; i++) {
     var fDate = new Date(today); fDate.setDate(fDate.getDate() + i + 1);
@@ -493,9 +488,7 @@ function computeForecastV4(site, recent, dailyStats, analogTraces, weather, warn
     seasonalP75.push(ds && ds.p75 != null ? ds.p75 : currentQ * 1.3);
   }
 
-  /* Percentile-anchored target: instead of always reverting to p50,
-     revert toward the percentile that matches current conditions.
-     If flow is at p75, revert toward a blend of p50 and p75. */
+  /* Percentile-anchored target */
   var todayKey = pad2(today.getMonth()+1) + '-' + pad2(today.getDate());
   var todayP50 = (dailyStats && dailyStats[todayKey] && dailyStats[todayKey].p50 != null)
     ? dailyStats[todayKey].p50 : currentQ;
@@ -504,61 +497,96 @@ function computeForecastV4(site, recent, dailyStats, analogTraces, weather, warn
   var todayP75 = (dailyStats && dailyStats[todayKey] && dailyStats[todayKey].p75 != null)
     ? dailyStats[todayKey].p75 : currentQ * 1.3;
 
-  /* Where does current Q sit relative to percentiles? */
-  var pctilePos = 0.5; /* default: at median */
+  var pctilePos = 0.5;
   if (currentQ <= todayP25) pctilePos = 0.25;
   else if (currentQ >= todayP75) pctilePos = 0.75;
   else if (currentQ < todayP50) pctilePos = 0.25 + 0.25 * (currentQ - todayP25) / Math.max(1, todayP50 - todayP25);
   else pctilePos = 0.50 + 0.25 * (currentQ - todayP50) / Math.max(1, todayP75 - todayP50);
 
-  /* Build percentile-anchored seasonal target for each forecast day */
   var targetQ = [];
   for (var i = 0; i < horizon; i++) {
     var t = i / (horizon - 1);
-    /* Gradually revert toward p50 as lead increases */
     var effectivePctile = pctilePos + (0.5 - pctilePos) * t * 0.7;
     if (effectivePctile <= 0.5) {
-      var w = (effectivePctile - 0.25) / 0.25;
-      w = Math.max(0, Math.min(1, w));
+      var w = Math.max(0, Math.min(1, (effectivePctile - 0.25) / 0.25));
       targetQ.push(seasonalP25[i] + w * (seasonalQ[i] - seasonalP25[i]));
     } else {
-      var w = (effectivePctile - 0.50) / 0.25;
-      w = Math.max(0, Math.min(1, w));
+      var w = Math.max(0, Math.min(1, (effectivePctile - 0.50) / 0.25));
       targetQ.push(seasonalQ[i] + w * (seasonalP75[i] - seasonalQ[i]));
     }
   }
 
-  /* AR(1) forecast with momentum and bias correction */
+  /* AR(1) forecast using smoothed initQ */
   var ar1 = [];
-  var prevLogQ = Math.log(Math.max(1, currentQ));
+  var prevLogQ = Math.log(Math.max(1, initQ));
   for (var i = 0; i < horizon; i++) {
     var logTarget = Math.log(Math.max(1, targetQ[i]));
-    /* Use adjusted phi for first few days, then revert to base phi */
     var effPhi = i < 3 ? phiAdj : phi;
     var logForecast = effPhi * prevLogQ + (1 - effPhi) * logTarget;
-    /* Apply bias correction (dampened over lead time) */
-    var bcDamp = Math.max(0, 1 - i * 0.12); /* full at day 0, fades by day 8 */
+    var bcDamp = Math.max(0, 1 - i * 0.12);
     ar1.push(Math.exp(logForecast) * (1 + (biasFactor - 1) * bcDamp));
     prevLogQ = logForecast;
   }
 
   /* ================================================================
-     METHOD 2: KNN Analog ensemble
+     METHOD 2: Trend Extrapolation (short-term only)
+     Linear extrapolation in log-space from recent trajectory.
+     Most accurate for day 1-3, meaningless beyond day 5.
+     ================================================================ */
+  var trend = [];
+  if (n >= 7) {
+    var logLast7 = last7.map(function(v) { return Math.log(Math.max(1, v)); });
+    var logSlope = linearSlope(logLast7);
+    var logLast = Math.log(Math.max(1, initQ));
+    for (var i = 0; i < horizon; i++) {
+      /* Extrapolate with dampening: slope decays to 0 over 7 days */
+      var dampSlope = logSlope * Math.max(0, 1 - i / 7);
+      trend.push(Math.exp(logLast + dampSlope * (i + 1)));
+    }
+  } else {
+    for (var i = 0; i < horizon; i++) trend.push(currentQ);
+  }
+
+  /* ================================================================
+     METHOD 3: KNN Analog ensemble with outlier trimming
+     Remove the most extreme trace before computing weighted mean
+     if we have enough analogs (trimmed weighted mean).
      ================================================================ */
   var knnMedian = [];
   var knnTraces = [];
   if (analogTraces && analogTraces.length >= 3) {
     for (var d = 0; d < horizon; d++) {
-      var weightedSum = 0;
       var traceVals = [];
+      var traceWeights = [];
       for (var k = 0; k < analogTraces.length; k++) {
         var ratio = analogTraces[k].trace[d] || 1.0;
-        var val = currentQ * ratio;
-        weightedSum += val * analogTraces[k].weight;
-        traceVals.push(val);
+        traceVals.push(currentQ * ratio);
+        traceWeights.push(analogTraces[k].weight);
       }
+
+      /* Trimmed weighted mean: remove most extreme value if K >= 5 */
+      var useVals = traceVals.slice();
+      var useWeights = traceWeights.slice();
+      if (useVals.length >= 5) {
+        /* Find the value furthest from the weighted mean */
+        var rawWmean = 0;
+        for (var k = 0; k < useVals.length; k++) rawWmean += useVals[k] * useWeights[k];
+        var maxDevIdx = 0, maxDev = 0;
+        for (var k = 0; k < useVals.length; k++) {
+          var dev = Math.abs(Math.log(useVals[k]) - Math.log(Math.max(1, rawWmean)));
+          if (dev > maxDev) { maxDev = dev; maxDevIdx = k; }
+        }
+        useVals.splice(maxDevIdx, 1);
+        useWeights.splice(maxDevIdx, 1);
+        /* Re-normalize weights */
+        var wt = useWeights.reduce(function(a,b){return a+b;}, 0);
+        for (var k = 0; k < useWeights.length; k++) useWeights[k] /= wt;
+      }
+
+      var weightedSum = 0;
+      for (var k = 0; k < useVals.length; k++) weightedSum += useVals[k] * useWeights[k];
       knnMedian.push(weightedSum);
-      knnTraces.push(traceVals);
+      knnTraces.push(traceVals); /* keep all traces for uncertainty */
     }
   } else {
     for (var d = 0; d < horizon; d++) {
@@ -568,43 +596,35 @@ function computeForecastV4(site, recent, dailyStats, analogTraces, weather, warn
   }
 
   /* ================================================================
-     METHOD 3: Percentile-anchored climatology
-     Instead of always p50, use the percentile-anchored target
-     that respects current conditions.
+     METHOD 4: Percentile-anchored climatology
      ================================================================ */
   /* targetQ computed above */
 
   /* ================================================================
      DYNAMIC METHOD WEIGHTING
-
-     Evaluate recent "would-have" performance of each method over
-     the last 7 days and adjust weights accordingly.
-
-     Methods that have been tracking recent observations well get
-     a bonus; methods that have been off get penalized.
      ================================================================ */
   var ar1Skill = 1.0, knnSkill = 1.0;
   if (n >= 14 && dailyStats) {
-    var ar1Errs = [], knnErrs = [];
+    var ar1Errs = [];
     for (var b = 7; b >= 1; b--) {
       var bIdx = n - 1 - b;
       if (bIdx < 1) continue;
       var bDate = new Date(today); bDate.setDate(bDate.getDate() - b);
       var bKey = pad2(bDate.getMonth()+1) + '-' + pad2(bDate.getDate());
       var bSeas = (dailyStats[bKey] && dailyStats[bKey].p50 != null) ? dailyStats[bKey].p50 : q[bIdx];
-      /* AR(1) retrocast error */
       var ar1Pred = Math.exp(phi * Math.log(Math.max(1, q[bIdx-1])) + (1-phi) * Math.log(Math.max(1, bSeas)));
-      var actual_b = q[bIdx];
-      ar1Errs.push(Math.abs(Math.log(ar1Pred) - Math.log(Math.max(1, actual_b))));
+      ar1Errs.push(Math.abs(Math.log(ar1Pred) - Math.log(Math.max(1, q[bIdx]))));
     }
     var ar1MeanErr = ar1Errs.length > 0 ? ar1Errs.reduce(function(a,b){return a+b;},0) / ar1Errs.length : 0.1;
-    /* Convert error to skill: lower error → higher skill */
     ar1Skill = 1 / (1 + ar1MeanErr * 5);
     knnSkill = analogTraces && analogTraces.length >= 3 ? 1 / (1 + ar1MeanErr * 3) : 0.5;
   }
 
   /* ================================================================
-     ADAPTIVE BLENDING in log-space with dynamic weights
+     FOUR-METHOD ADAPTIVE BLENDING in log-space
+
+     Methods: AR(1), Trend Extrapolation, KNN, Climatology
+     Trend gets high weight at short leads, zero at long leads.
      ================================================================ */
   var logAnomaly = Math.abs(Math.log(Math.max(1,currentQ)) - Math.log(Math.max(1,todayP50)));
   var anomalyFactor = Math.min(1, logAnomaly / 1.0);
@@ -613,34 +633,40 @@ function computeForecastV4(site, recent, dailyStats, analogTraces, weather, warn
   for (var i = 0; i < horizon; i++) {
     var t = i / (horizon - 1);
 
-    /* Base weights */
-    var wAR1  = 0.50 - 0.40 * t;   /* 0.50 → 0.10 */
-    var wKNN  = 0.35 - 0.10 * t;   /* 0.35 → 0.25 */
-    var wClim = 0.15 + 0.50 * t;   /* 0.15 → 0.65 */
+    /* Base weights for 4 methods */
+    var wTrend = Math.max(0, 0.20 - 0.20 * (i / 4)); /* 0.20 → 0 by day 5 */
+    var wAR1  = (0.40 - 0.30 * t) * (1 - wTrend/0.50);
+    var wKNN  = (0.30 - 0.05 * t);
+    var wClim = (0.10 + 0.50 * t);
 
-    /* Adaptive: anomalous conditions → more dynamic weight */
-    var climShift = anomalyFactor * 0.15 * (1 - t*0.5);
+    /* Normalize to 1 */
+    var wBase = wTrend + wAR1 + wKNN + wClim;
+    wTrend /= wBase; wAR1 /= wBase; wKNN /= wBase; wClim /= wBase;
+
+    /* Adaptive: anomalous → reduce climatology */
+    var climShift = anomalyFactor * 0.12 * (1 - t*0.5);
     wClim = Math.max(0.05, wClim - climShift);
-    wAR1 += climShift * 0.5;
-    wKNN += climShift * 0.5;
+    wAR1 += climShift * 0.4;
+    wKNN += climShift * 0.4;
+    wTrend += climShift * 0.2;
 
-    /* Dynamic: skill-based adjustment (±10% max shift) */
+    /* Dynamic skill-based adjustment */
     var skillTotal = ar1Skill + knnSkill + 0.5;
     var dynAR1 = ar1Skill / skillTotal;
     var dynKNN = knnSkill / skillTotal;
-    var dynClim = 0.5 / skillTotal;
-    /* Blend: 70% base weights + 30% skill-driven weights */
-    wAR1 = 0.70 * wAR1 + 0.30 * dynAR1 * (wAR1 + wKNN + wClim);
-    wKNN = 0.70 * wKNN + 0.30 * dynKNN * (1 - wClim * 0.70 / (wAR1 + wKNN + wClim));
+    wAR1 = 0.75 * wAR1 + 0.25 * dynAR1 * (wAR1 + wKNN);
+    wKNN = 0.75 * wKNN + 0.25 * dynKNN * (wAR1 + wKNN);
+
     /* Re-normalize */
-    var wSum = wAR1 + wKNN + wClim;
-    wAR1 /= wSum; wKNN /= wSum; wClim /= wSum;
+    var wSum = wTrend + wAR1 + wKNN + wClim;
+    wTrend /= wSum; wAR1 /= wSum; wKNN /= wSum; wClim /= wSum;
 
     /* Blend in log-space */
+    var logTrend = Math.log(Math.max(1, trend[i]));
     var logAR1  = Math.log(Math.max(1, ar1[i]));
     var logKNN  = Math.log(Math.max(1, knnMedian[i]));
     var logClim = Math.log(Math.max(1, targetQ[i]));
-    var logBlend = wAR1 * logAR1 + wKNN * logKNN + wClim * logClim;
+    var logBlend = wTrend * logTrend + wAR1 * logAR1 + wKNN * logKNN + wClim * logClim;
     blended.push(Math.exp(logBlend));
   }
 
