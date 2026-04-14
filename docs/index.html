@@ -106,7 +106,7 @@
               <th>Forecast (cfs)</th>
               <th>Low (cfs)</th>
               <th>High (cfs)</th>
-              <th>AR(1)</th>
+              <th>AR(2)</th>
               <th>KNN</th>
               <th>Seasonal</th>
               <th>Hi &deg;F</th>
@@ -133,17 +133,19 @@
         </ol>
         <p style="margin:0.8rem 0 0.4rem;font-weight:600;color:var(--text)">Forecast Methods</p>
         <ol style="margin:0.3rem 0 1rem 1.5rem">
-          <li><strong>AR(1) Persistence</strong> &mdash; Autoregressive model in log-space that reverts toward the seasonal median. Most accurate at 1&ndash;3 day lead times. The autocorrelation &phi; is fitted from recent observed data.</li>
-          <li><strong>KNN Historical Analogs</strong> &mdash; Finds the 7 most similar historical years from 15 candidates (matched by flow level + 7-day trajectory in log-space) and uses their subsequent 14-day traces as an ensemble. Weighted by inverse distance.</li>
-          <li><strong>Seasonal Climatology</strong> &mdash; The historical median (p50) flow for each upcoming day-of-year &mdash; the &ldquo;no-skill&rdquo; baseline that captures the long-term seasonal cycle.</li>
+          <li><strong>AR(2) Persistence</strong> &mdash; Second-order autoregressive model in log-space with momentum capture. Uses two lagged terms (Yule-Walker estimation) for better short-term accuracy. Includes flow-dependent &phi; (anomalous flows decay faster) and recession curve fitting on falling limbs.</li>
+          <li><strong>Trend Extrapolation</strong> &mdash; Log-space linear trend from the last 7 days, extrapolated forward with dampening (fades to zero by day 5). Captures short-term momentum that AR models smooth away.</li>
+          <li><strong>KNN Historical Analogs</strong> &mdash; Finds the 7 most similar historical years from 15 candidates using a 4-feature distance metric (flow level, trajectory, acceleration, variability). Blended via log-space weighted geometric mean with outlier trimming.</li>
+          <li><strong>Percentile-Anchored Climatology</strong> &mdash; Targets the historical percentile matching the current flow position, gradually reverting toward the median (p50) over the forecast horizon.</li>
         </ol>
         <p style="margin:0.8rem 0 0.4rem;font-weight:600;color:var(--text)">Blending &amp; Uncertainty</p>
         <ul style="margin:0.3rem 0 1rem 1.5rem">
-          <li>Blending performed in <strong>log-space</strong> to prevent high-flow bias</li>
-          <li>Short-term (day 1&ndash;3): 50% AR(1) + 35% KNN + 15% climatology</li>
-          <li>Medium-term (day 4&ndash;7): ~30% AR(1) + ~35% KNN + ~35% climatology</li>
-          <li>Long-term (day 8&ndash;14): 10% AR(1) + 25% KNN + 65% climatology</li>
-          <li><strong>Adaptive weights</strong>: when current flow is far from seasonal median, dynamic methods (AR1/KNN) get more weight</li>
+          <li>All blending performed in <strong>log-space</strong> (geometric means) to prevent high-flow bias</li>
+          <li>Short-term (day 1&ndash;3): ~25% Trend + ~40% AR(2) + ~25% KNN + ~10% climatology</li>
+          <li>Medium-term (day 4&ndash;7): ~25% AR(2) + ~25% KNN + ~40% climatology</li>
+          <li>Long-term (day 8&ndash;14): ~10% AR(2) + ~20% KNN + ~60% climatology</li>
+          <li><strong>Adaptive weights</strong>: dynamic skill-based weighting from recent retrocast performance; anomalous flows reduce climatology weight</li>
+          <li><strong>Bias correction</strong>: retrospective AR(2) error analysis corrects systematic over/underprediction (clamped &plusmn;15%)</li>
           <li>Season-aware NWS temperature perturbation (highest sensitivity in spring snowmelt, lowest in winter baseflow)</li>
           <li>Uncertainty bands from KNN trace spread (short-term) blended with historical p10/p90 percentiles (long-term)</li>
         </ul>

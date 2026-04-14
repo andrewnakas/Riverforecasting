@@ -451,10 +451,13 @@ function computeForecastV4(site, recent, dailyStats, analogTraces, weather, warn
   }
 
   /* ================================================================
-     METHOD 1: Momentum-aware AR(1) in log-space
-     Uses smoothed initQ for noise robustness.
+     METHOD 1: Momentum-aware AR(2) in log-space
+     AR(2) uses two lagged terms for better short-term accuracy.
+     phi1 captures day-to-day persistence, phi2 captures momentum.
+     Also flow-dependent: high anomalous flows decay faster.
      ================================================================ */
   var phi = 0.95;
+  var phi2 = 0.0; /* AR(2) coefficient */
   if (n >= 14) {
     var logQ = [];
     for (var i = 0; i < n; i++) logQ.push(Math.log(Math.max(1, q[i])));
@@ -471,11 +474,45 @@ function computeForecastV4(site, recent, dailyStats, analogTraces, weather, warn
       }
       if (den > 0) phi = Math.max(0.80, Math.min(0.98, num/den));
     }
+    /* Estimate AR(2) term from lag-2 autocorrelation */
+    if (n >= 21) {
+      var pairs2 = [];
+      for (var i = 2; i < logQ.length; i++) pairs2.push([logQ[i-2], logQ[i]]);
+      if (pairs2.length >= 7) {
+        var mx2 = 0, my2 = 0;
+        for (var i = 0; i < pairs2.length; i++) { mx2 += pairs2[i][0]; my2 += pairs2[i][1]; }
+        mx2 /= pairs2.length; my2 /= pairs2.length;
+        var num2 = 0, den2 = 0;
+        for (var i = 0; i < pairs2.length; i++) {
+          num2 += (pairs2[i][0]-mx2)*(pairs2[i][1]-my2);
+          den2 += (pairs2[i][0]-mx2)*(pairs2[i][0]-mx2);
+        }
+        var rho2 = den2 > 0 ? num2 / den2 : 0;
+        /* phi2 = (rho2 - phi^2) / (1 - phi^2) — Yule-Walker */
+        var phi2raw = (rho2 - phi * phi) / Math.max(0.01, 1 - phi * phi);
+        phi2 = Math.max(-0.10, Math.min(0.15, phi2raw));
+      }
+    }
   }
 
-  var phiAdj = phi;
-  if (regime === 1) phiAdj = Math.min(0.99, phi + 0.02);
-  else if (regime === 0) phiAdj = Math.max(0.80, phi - 0.01);
+  /* Flow-dependent phi: high anomalous flows decay faster toward seasonal */
+  var logAnomaly = Math.abs(Math.log(Math.max(1,currentQ)) - Math.log(Math.max(1,
+    (dailyStats && dailyStats[pad2(today.getMonth()+1)+'-'+pad2(today.getDate())] &&
+     dailyStats[pad2(today.getMonth()+1)+'-'+pad2(today.getDate())].p50 != null)
+    ? dailyStats[pad2(today.getMonth()+1)+'-'+pad2(today.getDate())].p50 : currentQ)));
+  var phiFlowAdj = logAnomaly > 0.5 ? -0.02 * Math.min(1, (logAnomaly - 0.5) / 1.0) : 0;
+
+  var phiAdj = phi + phiFlowAdj;
+  if (regime === 1) phiAdj = Math.min(0.99, phiAdj + 0.02);
+  else if (regime === 0) phiAdj = Math.max(0.80, phiAdj - 0.01);
+
+  /* Recession curve detection: fit exponential decay on falling limb */
+  var recessionRate = 0;
+  if (regime === -1 && n >= 7) {
+    var logLast = last7.map(function(v){return Math.log(Math.max(1,v));});
+    recessionRate = -linearSlope(logLast); /* positive = decaying */
+    recessionRate = Math.max(0, Math.min(0.10, recessionRate));
+  }
 
   /* Seasonal medians and percentile data */
   var seasonalQ = [], seasonalP25 = [], seasonalP75 = [];
@@ -516,15 +553,25 @@ function computeForecastV4(site, recent, dailyStats, analogTraces, weather, warn
     }
   }
 
-  /* AR(1) forecast using smoothed initQ */
+  /* AR(2) forecast using smoothed initQ */
   var ar1 = [];
   var prevLogQ = Math.log(Math.max(1, initQ));
+  var prevLogQ2 = n >= 2 ? Math.log(Math.max(1, q[n-2])) : prevLogQ;
   for (var i = 0; i < horizon; i++) {
     var logTarget = Math.log(Math.max(1, targetQ[i]));
     var effPhi = i < 3 ? phiAdj : phi;
-    var logForecast = effPhi * prevLogQ + (1 - effPhi) * logTarget;
+    /* AR(2): phi1*X(t-1) + phi2*X(t-2) + (1-phi1-phi2)*seasonal */
+    var effPhi2 = i < 5 ? phi2 : phi2 * 0.5; /* fade AR(2) at longer leads */
+    var logForecast = effPhi * prevLogQ + effPhi2 * prevLogQ2 + (1 - effPhi - effPhi2) * logTarget;
+    /* Recession curve: if falling, apply exponential decay */
+    if (recessionRate > 0 && i < 7) {
+      var recessionPred = Math.log(Math.max(1, initQ)) - recessionRate * (i + 1);
+      var recW = Math.max(0, 0.3 * (1 - i / 7)); /* fade recession influence */
+      logForecast = (1 - recW) * logForecast + recW * recessionPred;
+    }
     var bcDamp = Math.max(0, 1 - i * 0.12);
     ar1.push(Math.exp(logForecast) * (1 + (biasFactor - 1) * bcDamp));
+    prevLogQ2 = prevLogQ;
     prevLogQ = logForecast;
   }
 
@@ -568,12 +615,12 @@ function computeForecastV4(site, recent, dailyStats, analogTraces, weather, warn
       var useVals = traceVals.slice();
       var useWeights = traceWeights.slice();
       if (useVals.length >= 5) {
-        /* Find the value furthest from the weighted mean */
-        var rawWmean = 0;
-        for (var k = 0; k < useVals.length; k++) rawWmean += useVals[k] * useWeights[k];
+        /* Find the value furthest from the weighted geometric mean */
+        var rawLogWm = 0;
+        for (var k = 0; k < useVals.length; k++) rawLogWm += Math.log(Math.max(1, useVals[k])) * useWeights[k];
         var maxDevIdx = 0, maxDev = 0;
         for (var k = 0; k < useVals.length; k++) {
-          var dev = Math.abs(Math.log(useVals[k]) - Math.log(Math.max(1, rawWmean)));
+          var dev = Math.abs(Math.log(Math.max(1, useVals[k])) - rawLogWm);
           if (dev > maxDev) { maxDev = dev; maxDevIdx = k; }
         }
         useVals.splice(maxDevIdx, 1);
@@ -583,9 +630,10 @@ function computeForecastV4(site, recent, dailyStats, analogTraces, weather, warn
         for (var k = 0; k < useWeights.length; k++) useWeights[k] /= wt;
       }
 
-      var weightedSum = 0;
-      for (var k = 0; k < useVals.length; k++) weightedSum += useVals[k] * useWeights[k];
-      knnMedian.push(weightedSum);
+      /* Log-space weighted mean (geometric mean) — avoids high-flow bias */
+      var logWeightedSum = 0;
+      for (var k = 0; k < useVals.length; k++) logWeightedSum += Math.log(Math.max(1, useVals[k])) * useWeights[k];
+      knnMedian.push(Math.exp(logWeightedSum));
       knnTraces.push(traceVals); /* keep all traces for uncertainty */
     }
   } else {
@@ -633,11 +681,11 @@ function computeForecastV4(site, recent, dailyStats, analogTraces, weather, warn
   for (var i = 0; i < horizon; i++) {
     var t = i / (horizon - 1);
 
-    /* Base weights for 4 methods */
-    var wTrend = Math.max(0, 0.20 - 0.20 * (i / 4)); /* 0.20 → 0 by day 5 */
-    var wAR1  = (0.40 - 0.30 * t) * (1 - wTrend/0.50);
-    var wKNN  = (0.30 - 0.05 * t);
-    var wClim = (0.10 + 0.50 * t);
+    /* Base weights for 4 methods — optimized for benchmark scores */
+    var wTrend = Math.max(0, 0.25 - 0.25 * (i / 4)); /* 0.25 → 0 by day 5 */
+    var wAR1  = (0.45 - 0.35 * t) * (1 - wTrend/0.60);
+    var wKNN  = (0.25 - 0.05 * t);
+    var wClim = (0.05 + 0.55 * t);
 
     /* Normalize to 1 */
     var wBase = wTrend + wAR1 + wKNN + wClim;
@@ -695,16 +743,20 @@ function computeForecastV4(site, recent, dailyStats, analogTraces, weather, warn
     }
   }
 
-  /* Adaptive smoothing in log-space (prevents magnitude-dependent smoothing artifacts) */
+  /* Adaptive smoothing in log-space — lighter touch on early days for accuracy */
   var smoothed = [];
   var logBlended = blended.map(function(v) { return Math.log(Math.max(1, v)); });
   for (var i = 0; i < horizon; i++) {
     var logSmooth;
-    if (i <= 2) {
-      /* Days 1-3: 3-point smooth */
-      if (i === 0) logSmooth = (logBlended[0]*2 + logBlended[1]) / 3;
-      else if (i === horizon-1) logSmooth = (logBlended[i-1] + logBlended[i]*2) / 3;
-      else logSmooth = (logBlended[i-1] + logBlended[i] + logBlended[i+1]) / 3;
+    if (i === 0) {
+      /* Day 1: no smoothing — preserve best short-term accuracy */
+      logSmooth = logBlended[0];
+    } else if (i === 1) {
+      /* Day 2: very light 3-point smooth (center-weighted) */
+      logSmooth = (logBlended[0] + logBlended[1]*2 + logBlended[2]) / 4;
+    } else if (i === 2) {
+      /* Day 3: light 3-point smooth */
+      logSmooth = (logBlended[1] + logBlended[2] + logBlended[3]) / 3;
     } else {
       /* Days 4+: 5-point smooth */
       if (i >= 2 && i < horizon-2) {

@@ -231,11 +231,44 @@ async function runHindcast(siteNo, forecastDate, dailyStats, nAnalogYears) {
     }
   }
 
-  /* Phi with regime adjustment */
+  /* Phi with AR(2) estimation and flow-dependent adjustment */
   var phi = fitPhi(q);
-  var phiAdj = phi;
-  if (regime === 1) phiAdj = Math.min(0.99, phi + 0.02);
-  else if (regime === 0) phiAdj = Math.max(0.80, phi - 0.01);
+  var phi2 = 0.0;
+  if (n >= 21) {
+    var logQ2 = [];
+    for (var i = 0; i < n; i++) logQ2.push(Math.log(Math.max(1, q[i])));
+    var pairs2 = [];
+    for (var i = 2; i < logQ2.length; i++) pairs2.push([logQ2[i-2], logQ2[i]]);
+    if (pairs2.length >= 7) {
+      var mx2=0,my2=0;
+      for (var i=0;i<pairs2.length;i++){mx2+=pairs2[i][0];my2+=pairs2[i][1];}
+      mx2/=pairs2.length; my2/=pairs2.length;
+      var num2=0,den2=0;
+      for (var i=0;i<pairs2.length;i++){
+        num2+=(pairs2[i][0]-mx2)*(pairs2[i][1]-my2);
+        den2+=(pairs2[i][0]-mx2)*(pairs2[i][0]-mx2);
+      }
+      var rho2 = den2 > 0 ? num2/den2 : 0;
+      var phi2raw = (rho2 - phi*phi) / Math.max(0.01, 1 - phi*phi);
+      phi2 = Math.max(-0.10, Math.min(0.15, phi2raw));
+    }
+  }
+
+  /* Flow-dependent phi: high anomalous flows decay faster */
+  var logAnomaly = Math.abs(Math.log(Math.max(1,currentQ)) - Math.log(Math.max(1,todayP50)));
+  var phiFlowAdj = logAnomaly > 0.5 ? -0.02 * Math.min(1, (logAnomaly - 0.5) / 1.0) : 0;
+
+  var phiAdj = phi + phiFlowAdj;
+  if (regime === 1) phiAdj = Math.min(0.99, phiAdj + 0.02);
+  else if (regime === 0) phiAdj = Math.max(0.80, phiAdj - 0.01);
+
+  /* Recession curve detection */
+  var recessionRate = 0;
+  if (regime === -1 && n >= 7) {
+    var logLast = last7.map(function(v){return Math.log(Math.max(1,v));});
+    recessionRate = -linearSlope(logLast);
+    recessionRate = Math.max(0, Math.min(0.10, recessionRate));
+  }
 
   /* Seasonal data with percentile anchoring */
   var seasonalQ = [], seasonalP25 = [], seasonalP75 = [];
@@ -272,14 +305,22 @@ async function runHindcast(siteNo, forecastDate, dailyStats, nAnalogYears) {
     }
   }
 
-  /* Method 1: Momentum-aware AR(1) with smoothed initQ and bias correction */
+  /* Method 1: AR(2) with smoothed initQ, recession curves, bias correction */
   var ar1 = [];
   var prevLogQ = Math.log(Math.max(1, initQ));
+  var prevLogQ2 = n >= 2 ? Math.log(Math.max(1, q[n-2])) : prevLogQ;
   for (var i = 0; i < horizon; i++) {
     var effPhi = i < 3 ? phiAdj : phi;
-    var logF = effPhi * prevLogQ + (1 - effPhi) * Math.log(Math.max(1, targetQ[i]));
+    var effPhi2 = i < 5 ? phi2 : phi2 * 0.5;
+    var logF = effPhi * prevLogQ + effPhi2 * prevLogQ2 + (1 - effPhi - effPhi2) * Math.log(Math.max(1, targetQ[i]));
+    if (recessionRate > 0 && i < 7) {
+      var recPred = Math.log(Math.max(1, initQ)) - recessionRate * (i + 1);
+      var recW = Math.max(0, 0.3 * (1 - i / 7));
+      logF = (1 - recW) * logF + recW * recPred;
+    }
     var bcDamp = Math.max(0, 1 - i * 0.12);
     ar1.push(Math.exp(logF) * (1 + (biasFactor - 1) * bcDamp));
+    prevLogQ2 = prevLogQ;
     prevLogQ = logF;
   }
 
@@ -332,10 +373,10 @@ async function runHindcast(siteNo, forecastDate, dailyStats, nAnalogYears) {
   var blended = [];
   for (var i = 0; i < horizon; i++) {
     var t = i / (horizon - 1);
-    var wTrend = Math.max(0, 0.20 - 0.20 * (i / 4));
-    var wAR1  = (0.40 - 0.30 * t) * (1 - wTrend/0.50);
-    var wKNN  = (0.30 - 0.05 * t);
-    var wClim = (0.10 + 0.50 * t);
+    var wTrend = Math.max(0, 0.25 - 0.25 * (i / 4));
+    var wAR1  = (0.45 - 0.35 * t) * (1 - wTrend/0.60);
+    var wKNN  = (0.25 - 0.05 * t);
+    var wClim = (0.05 + 0.55 * t);
     var wBase = wTrend + wAR1 + wKNN + wClim;
     wTrend /= wBase; wAR1 /= wBase; wKNN /= wBase; wClim /= wBase;
     var climShift = anomalyFactor * 0.12 * (1 - t*0.5);
@@ -350,15 +391,17 @@ async function runHindcast(siteNo, forecastDate, dailyStats, nAnalogYears) {
     blended.push(Math.max(1, Math.exp(logBlend)));
   }
 
-  /* Smoothing in log-space */
+  /* Smoothing in log-space — lighter on early days */
   var smoothed = [];
   var logB = blended.map(function(v){return Math.log(Math.max(1,v));});
   for (var i = 0; i < horizon; i++) {
     var ls;
-    if (i <= 2) {
-      if (i === 0) ls = (logB[0]*2 + logB[1]) / 3;
-      else if (i === horizon-1) ls = (logB[i-1] + logB[i]*2) / 3;
-      else ls = (logB[i-1] + logB[i] + logB[i+1]) / 3;
+    if (i === 0) {
+      ls = logB[0]; /* No smoothing on day 1 */
+    } else if (i === 1) {
+      ls = (logB[0] + logB[1]*2 + logB[2]) / 4;
+    } else if (i === 2) {
+      ls = (logB[1] + logB[2] + logB[3]) / 3;
     } else {
       if (i >= 2 && i < horizon-2) ls = (logB[i-2]+logB[i-1]+logB[i]+logB[i+1]+logB[i+2])/5;
       else if (i === horizon-2) ls = (logB[i-1]+logB[i]+logB[i+1])/3;
@@ -435,20 +478,21 @@ function runKNNTrimmed(currentQ, analogTraces, horizon) {
     }
     /* Trim most extreme if K >= 5 */
     if (vals.length >= 5) {
-      var rawWm = 0;
-      for (var k = 0; k < vals.length; k++) rawWm += vals[k] * weights[k];
+      var rawLogWm = 0;
+      for (var k = 0; k < vals.length; k++) rawLogWm += Math.log(Math.max(1, vals[k])) * weights[k];
       var maxDI = 0, maxD = 0;
       for (var k = 0; k < vals.length; k++) {
-        var dv = Math.abs(Math.log(vals[k]) - Math.log(Math.max(1, rawWm)));
+        var dv = Math.abs(Math.log(Math.max(1, vals[k])) - rawLogWm);
         if (dv > maxD) { maxD = dv; maxDI = k; }
       }
       vals.splice(maxDI, 1); weights.splice(maxDI, 1);
       var wt = weights.reduce(function(a,b){return a+b;}, 0);
       for (var k = 0; k < weights.length; k++) weights[k] /= wt;
     }
-    var wsum = 0;
-    for (var k = 0; k < vals.length; k++) wsum += vals[k] * weights[k];
-    result.push(wsum);
+    /* Log-space weighted mean (geometric mean) */
+    var logWsum = 0;
+    for (var k = 0; k < vals.length; k++) logWsum += Math.log(Math.max(1, vals[k])) * weights[k];
+    result.push(Math.exp(logWsum));
   }
   return result;
 }
